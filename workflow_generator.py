@@ -219,8 +219,8 @@ class SeaIceWorkflow:
         self.rc = ReplicaCatalog()
 
     def create_workflow(self, region, start_date, end_date, granule_id=None,
-                        model_type="lstm", earthdata_username=None,
-                        earthdata_password=None):
+                        model_type="lstm", earthdata_token=None,
+                        earthdata_username=None, earthdata_password=None):
         """Create the workflow DAG."""
         logger.info("Creating workflow DAG")
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
@@ -257,7 +257,9 @@ class SeaIceWorkflow:
             .add_args(*download_atl03_args)
             .add_outputs(atl03_data, stage_out=True, register_replica=False)
         )
-        if earthdata_username and earthdata_password:
+        if earthdata_token:
+            download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
+        elif earthdata_username and earthdata_password:
             download_atl03_job.add_env(
                 EARTHDATA_USERNAME=earthdata_username,
                 EARTHDATA_PASSWORD=earthdata_password,
@@ -466,6 +468,13 @@ Available regions:
         help="Classifier model type (default: lstm)"
     )
     parser.add_argument(
+        "--earthdata-token",
+        type=str,
+        default=os.environ.get("EARTHDATA_TOKEN"),
+        help="NASA Earthdata bearer token (default: $EARTHDATA_TOKEN). "
+             "Preferred on networks where urs.earthdata.nasa.gov is unreachable."
+    )
+    parser.add_argument(
         "--earthdata-username",
         type=str,
         default=os.environ.get("EARTHDATA_USERNAME"),
@@ -493,11 +502,11 @@ Available regions:
         logger.error(f"Invalid region: {args.region}. Valid regions: {valid_regions}")
         sys.exit(1)
 
-    if not args.earthdata_username or not args.earthdata_password:
+    if not args.earthdata_token and (not args.earthdata_username or not args.earthdata_password):
         logger.warning(
-            "Earthdata credentials not fully provided (--earthdata-username/--earthdata-password "
-            "or $EARTHDATA_USERNAME/$EARTHDATA_PASSWORD). "
-            "download_atl03 will fail without NASA Earthdata credentials. "
+            "No Earthdata credentials provided. Provide either:\n"
+            "  --earthdata-token / $EARTHDATA_TOKEN (preferred for FABRIC), or\n"
+            "  --earthdata-username + --earthdata-password / $EARTHDATA_USERNAME + $EARTHDATA_PASSWORD\n"
             "Register at: https://urs.earthdata.nasa.gov/"
         )
 
@@ -509,7 +518,7 @@ Available regions:
     logger.info(f"Model type: {args.model_type}")
     if args.granule_id:
         logger.info(f"Granule ID: {args.granule_id}")
-    logger.info(f"Earthdata credentials: {'provided' if args.earthdata_username else 'NOT SET'}")
+    logger.info(f"Earthdata auth: {'token' if args.earthdata_token else 'username/password' if args.earthdata_username else 'NOT SET'}")
     logger.info(f"Execution site: {args.execution_site_name}")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
@@ -537,6 +546,7 @@ Available regions:
             end_date=args.end_date,
             granule_id=args.granule_id,
             model_type=args.model_type,
+            earthdata_token=args.earthdata_token,
             earthdata_username=args.earthdata_username,
             earthdata_password=args.earthdata_password,
         )

@@ -53,13 +53,24 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
     import h5py
     import numpy as np
 
-    # Authenticate with NASA Earthdata using environment variables
+    # Authenticate with NASA Earthdata
+    # Prefer pre-generated bearer token (EARTHDATA_TOKEN) to bypass login endpoint
+    # (urs.earthdata.nasa.gov may be unreachable from some networks like FABRIC)
     logger.info("Authenticating with NASA Earthdata...")
-    if os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"):
+    token = os.environ.get("EARTHDATA_TOKEN")
+    if token:
+        logger.info("Using pre-generated EARTHDATA_TOKEN (bypassing login endpoint)")
+        earthaccess.__auth__ = earthaccess.Auth()
+        earthaccess.__auth__.token = {"access_token": token}
+        earthaccess.__auth__.authenticated = True
+    elif os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"):
+        logger.info("Using EARTHDATA_USERNAME/PASSWORD login")
         earthaccess.login(strategy="environment")
     else:
         raise RuntimeError(
-            "EARTHDATA_USERNAME and EARTHDATA_PASSWORD environment variables are not set. "
+            "NASA Earthdata credentials not set. Provide either:\n"
+            "  - EARTHDATA_TOKEN (pre-generated bearer token), or\n"
+            "  - EARTHDATA_USERNAME and EARTHDATA_PASSWORD\n"
             "Register at https://urs.earthdata.nasa.gov/"
         )
 
