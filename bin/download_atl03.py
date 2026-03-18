@@ -48,21 +48,22 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
         granule_id: Optional specific granule ID to download
     """
     import os
+    from pathlib import Path
 
     import earthaccess
     import h5py
     import numpy as np
+    import requests
 
     # Authenticate with NASA Earthdata
     # Prefer pre-generated bearer token (EARTHDATA_TOKEN) to bypass login endpoint
     # (urs.earthdata.nasa.gov may be unreachable from some networks like FABRIC)
     logger.info("Authenticating with NASA Earthdata...")
     token = os.environ.get("EARTHDATA_TOKEN")
+    use_token = False
     if token:
         logger.info("Using pre-generated EARTHDATA_TOKEN (bypassing login endpoint)")
-        earthaccess.__auth__ = earthaccess.Auth()
-        earthaccess.__auth__.token = {"access_token": token}
-        earthaccess.__auth__.authenticated = True
+        use_token = True
     elif os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"):
         logger.info("Using EARTHDATA_USERNAME/PASSWORD login")
         earthaccess.login(strategy="environment")
@@ -85,7 +86,7 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
     logger.info(f"Searching ATL03 granules for region bbox={bbox}")
     logger.info(f"Date range: {start_date} to {end_date}")
 
-    # Search for ATL03 granules
+    # Search for ATL03 granules (CMR search works without login)
     results = earthaccess.search_data(
         short_name="ATL03",
         bounding_box=bbox,
@@ -101,8 +102,34 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
         logger.error("No ATL03 granules found for the specified criteria")
         sys.exit(1)
 
-    # Download granules to temporary directory
-    downloaded_files = earthaccess.download(results, local_path=".")
+    # Download granules
+    if use_token:
+        # Direct download with bearer token — bypasses earthaccess.download()
+        # which requires a full login session via urs.earthdata.nasa.gov
+        logger.info("Downloading with bearer token (direct HTTPS)...")
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        downloaded_files = []
+        for i, granule in enumerate(results):
+            urls = granule.data_links(access="external")
+            if not urls:
+                logger.warning(f"No download URL for granule {i}")
+                continue
+            url = urls[0]
+            filename = Path(url).name
+            logger.info(f"  [{i+1}/{len(results)}] Downloading {filename}...")
+            resp = session.get(url, stream=True, timeout=300)
+            if resp.status_code == 200:
+                with open(filename, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                downloaded_files.append(filename)
+                logger.info(f"  [{i+1}/{len(results)}] Saved {filename} ({os.path.getsize(filename) / 1e6:.1f} MB)")
+            else:
+                logger.warning(f"  [{i+1}/{len(results)}] Failed: HTTP {resp.status_code} for {url}")
+    else:
+        downloaded_files = earthaccess.download(results, local_path=".")
+
     logger.info(f"Downloaded {len(downloaded_files)} files")
 
     # Merge into a single output HDF5 file
