@@ -163,6 +163,15 @@ def train_model(input_file, model_output, metrics_output, model_type="lstm",
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
 
+    # Configure GPU: enable memory growth to avoid allocating all VRAM
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logger.info(f"GPU(s) available: {[g.name for g in gpus]}")
+    else:
+        logger.info("No GPU detected, using CPU")
+
     logger.info(f"Loading labeled data from {input_file}")
     df = pd.read_csv(input_file)
     logger.info(f"Total samples: {len(df):,}")

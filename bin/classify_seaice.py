@@ -87,6 +87,15 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256):
     import pandas as pd
     import tensorflow as tf
 
+    # Configure GPU: enable memory growth to avoid allocating all VRAM
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logger.info(f"GPU(s) available: {[g.name for g in gpus]}")
+    else:
+        logger.info("No GPU detected, using CPU")
+
     logger.info(f"Loading preprocessed data from {input_file}")
     df = pd.read_csv(input_file)
     logger.info(f"Total segments: {len(df):,}")

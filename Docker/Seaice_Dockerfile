@@ -1,24 +1,32 @@
-FROM python:3.10-slim
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
-# Install system dependencies
+# Install system dependencies and Python 3.10
 RUN apt-get update && \
-    apt-get install -y git wget curl openssh-client build-essential \
+    apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip \
+    git wget curl openssh-client build-essential \
     libgdal-dev gdal-bin libhdf5-dev libproj-dev libgeos-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
+
+# Install Python dependencies with GPU-enabled TensorFlow
 RUN pip install --no-cache-dir \
     numpy \
     pandas \
     scipy \
     scikit-learn \
     h5py \
-    tensorflow \
+    "tensorflow[and-cuda]" \
     matplotlib \
     rasterio \
     pyproj \
     cartopy \
-    earthaccess \
+    "earthaccess>=0.12.0" \
     planetary-computer \
     pystac-client
 
@@ -27,6 +35,10 @@ WORKDIR /app
 
 # Set Python to not buffer output
 ENV PYTHONUNBUFFERED=1
+
+# NVIDIA runtime environment
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Create output directory
 RUN mkdir -p /app/output
