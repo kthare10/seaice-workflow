@@ -48,12 +48,14 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
         granule_id: Optional specific granule ID to download
     """
     import os
+    import time
     from pathlib import Path
 
     import earthaccess
     import h5py
     import numpy as np
     import requests
+    from requests.exceptions import ConnectionError, ChunkedEncodingError, SSLError
 
     # Authenticate with NASA Earthdata
     # Prefer pre-generated bearer token (EARTHDATA_TOKEN) to bypass login endpoint
@@ -109,6 +111,8 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
         logger.info("Downloading with bearer token (direct HTTPS)...")
         session = requests.Session()
         session.headers.update({"Authorization": f"Bearer {token}"})
+        max_retries = 5
+        base_delay = 5
         downloaded_files = []
         for i, granule in enumerate(results):
             urls = granule.data_links(access="external")
@@ -118,15 +122,33 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
             url = urls[0]
             filename = Path(url).name
             logger.info(f"  [{i+1}/{len(results)}] Downloading {filename}...")
-            resp = session.get(url, stream=True, timeout=300)
-            if resp.status_code == 200:
-                with open(filename, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                downloaded_files.append(filename)
-                logger.info(f"  [{i+1}/{len(results)}] Saved {filename} ({os.path.getsize(filename) / 1e6:.1f} MB)")
-            else:
-                logger.warning(f"  [{i+1}/{len(results)}] Failed: HTTP {resp.status_code} for {url}")
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    resp = session.get(url, stream=True, timeout=300)
+                    if resp.status_code != 200:
+                        logger.warning(f"  [{i+1}/{len(results)}] HTTP {resp.status_code} for {url}")
+                        break
+                    with open(filename, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    downloaded_files.append(filename)
+                    logger.info(f"  [{i+1}/{len(results)}] Saved {filename} ({os.path.getsize(filename) / 1e6:.1f} MB)")
+                    break
+                except (SSLError, ConnectionError, ChunkedEncodingError) as e:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"  [{i+1}/{len(results)}] Attempt {attempt}/{max_retries} "
+                        f"failed: {e}. Retrying in {delay}s..."
+                    )
+                    # Drop stale connections before retrying
+                    session.close()
+                    session = requests.Session()
+                    session.headers.update({"Authorization": f"Bearer {token}"})
+                    if attempt < max_retries:
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"  [{i+1}/{len(results)}] All {max_retries} attempts failed for {filename}")
     else:
         downloaded_files = earthaccess.download(results, local_path=".")
 
