@@ -33,38 +33,38 @@ download_sentinel2 ──┘
 - [Pegasus WMS](https://pegasus.isi.edu/) 5.0+
 - HTCondor (for condorpool execution)
 - NVIDIA GPU with CUDA drivers on worker nodes (for training/classification)
-- NASA Earthdata account with a bearer token (see below)
+- NASA Earthdata account (see below)
 
 ### NASA Earthdata Credentials
 
-The `download_atl03` stage authenticates with NASA Earthdata using a bearer token
-passed via the `EARTHDATA_TOKEN` environment variable.
+The `download_atl03` stage authenticates with NASA Earthdata using username/password
+passed via `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` environment variables.
 
 1. Create an account at <https://urs.earthdata.nasa.gov/>
-2. Generate a token at `https://urs.earthdata.nasa.gov/users/<username>/user_tokens`
-3. Pass the token to the workflow generator via `--earthdata-token` or the
-   `EARTHDATA_TOKEN` environment variable:
+2. Pass credentials to the workflow generator via CLI args or environment variables:
 
 ```bash
-export EARTHDATA_TOKEN="your_token_here"
+export EARTHDATA_USERNAME="your_username"
+export EARTHDATA_PASSWORD="your_password"
 ```
 
-The workflow generator will warn if no token is provided.
+The workflow generator will warn if credentials are not provided.
 
 ### Generate and Submit Workflow
 
 ```bash
-# Generate workflow DAG (token from $EARTHDATA_TOKEN)
+# Generate workflow DAG (credentials from env vars)
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-30 \
                               --output workflow.yml
 
-# Or pass the token explicitly
+# Or pass credentials explicitly
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-30 \
-                              --earthdata-token "your_token_here" \
+                              --earthdata-username "user" \
+                              --earthdata-password "pass" \
                               --output workflow.yml
 
 # Submit to HTCondor
@@ -80,7 +80,8 @@ pegasus-status <run-dir>
 --region              Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
 --start-date          Start date (YYYY-MM-DD)
 --end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
---earthdata-token     NASA Earthdata bearer token (default: $EARTHDATA_TOKEN)
+--earthdata-username  NASA Earthdata username (default: $EARTHDATA_USERNAME)
+--earthdata-password  NASA Earthdata password (default: $EARTHDATA_PASSWORD)
 --granule-id          Specific ATL03 granule ID (optional)
 --model-type          Classifier type: lstm (default) or mlp
 -e                    Execution site name (default: condorpool)
