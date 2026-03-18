@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Test artifacts
+test_data/
+test_output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Pegasus generated
+scratch/
+output/
+*.yml
+pegasus.properties
+replicas.yml
+sites.yml
+transformations.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
