@@ -47,13 +47,21 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
         output_file: Output HDF5 file path
         granule_id: Optional specific granule ID to download
     """
+    import os
+
     import earthaccess
     import h5py
     import numpy as np
 
-    # Authenticate with NASA Earthdata
+    # Authenticate with NASA Earthdata using EARTHDATA_TOKEN bearer token
     logger.info("Authenticating with NASA Earthdata...")
-    earthaccess.login(strategy="netrc")
+    if os.environ.get("EARTHDATA_TOKEN"):
+        earthaccess.login(strategy="environment")
+    else:
+        raise RuntimeError(
+            "EARTHDATA_TOKEN environment variable is not set. "
+            "Generate a token at https://urs.earthdata.nasa.gov/"
+        )
 
     # Get bounding box
     if isinstance(region, str):

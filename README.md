@@ -10,20 +10,20 @@ Calculation from ICESat-2 ATL03 Data"* (Iqrah et al., IPDPSW 2025)
 
 ```
 download_atl03 ──────┐
-                     ├──> preprocess_atl03 ──> auto_label ──> train_model ──> classify_seaice ──> calculate_freeboard ──> visualize_results
+                     ├──> preprocess_atl03 ──> auto_label ──> train_model [GPU] ──> classify_seaice [GPU] ──> calculate_freeboard ──> visualize_results
 download_sentinel2 ──┘
 ```
 
-| Stage | Description | Memory |
-|-------|-------------|--------|
-| `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata | 4 GB |
-| `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB |
-| `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB |
-| `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB |
-| `train_model` | Train LSTM or MLP classifier on labeled data | 16 GB |
-| `classify_seaice` | Run inference on full ATL03 dataset | 8 GB |
-| `calculate_freeboard` | Sliding-window sea surface detection + freeboard | 8 GB |
-| `visualize_results` | Generate maps, profiles, summary statistics | 4 GB |
+| Stage | Description | Memory | GPU |
+|-------|-------------|--------|-----|
+| `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata | 4 GB | No |
+| `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB | No |
+| `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
+| `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
+| `train_model` | Train LSTM or MLP classifier on labeled data | 16 GB | Yes |
+| `classify_seaice` | Run inference on full ATL03 dataset | 8 GB | Yes |
+| `calculate_freeboard` | Sliding-window sea surface detection + freeboard | 8 GB | No |
+| `visualize_results` | Generate maps, profiles, summary statistics | 4 GB | No |
 
 ## Quick Start
 
@@ -32,15 +32,39 @@ download_sentinel2 ──┘
 - Python 3.10+
 - [Pegasus WMS](https://pegasus.isi.edu/) 5.0+
 - HTCondor (for condorpool execution)
-- NASA Earthdata account (configured in `~/.netrc`)
+- NVIDIA GPU with CUDA drivers on worker nodes (for training/classification)
+- NASA Earthdata account with a bearer token (see below)
+
+### NASA Earthdata Credentials
+
+The `download_atl03` stage authenticates with NASA Earthdata using a bearer token
+passed via the `EARTHDATA_TOKEN` environment variable.
+
+1. Create an account at <https://urs.earthdata.nasa.gov/>
+2. Generate a token at `https://urs.earthdata.nasa.gov/users/<username>/user_tokens`
+3. Pass the token to the workflow generator via `--earthdata-token` or the
+   `EARTHDATA_TOKEN` environment variable:
+
+```bash
+export EARTHDATA_TOKEN="your_token_here"
+```
+
+The workflow generator will warn if no token is provided.
 
 ### Generate and Submit Workflow
 
 ```bash
-# Generate workflow DAG
+# Generate workflow DAG (token from $EARTHDATA_TOKEN)
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-30 \
+                              --output workflow.yml
+
+# Or pass the token explicitly
+python workflow_generator.py --region ross_sea \
+                              --start-date 2019-11-01 \
+                              --end-date 2019-11-30 \
+                              --earthdata-token "your_token_here" \
                               --output workflow.yml
 
 # Submit to HTCondor
@@ -53,14 +77,30 @@ pegasus-status <run-dir>
 ### Command-Line Options
 
 ```
---region          Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
---start-date      Start date (YYYY-MM-DD)
---end-date        End date (YYYY-MM-DD), defaults to start_date + 30 days
---granule-id      Specific ATL03 granule ID (optional)
---model-type      Classifier type: lstm (default) or mlp
--e                Execution site name (default: condorpool)
--o                Output workflow file (default: workflow.yml)
+--region              Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
+--start-date          Start date (YYYY-MM-DD)
+--end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
+--earthdata-token     NASA Earthdata bearer token (default: $EARTHDATA_TOKEN)
+--granule-id          Specific ATL03 granule ID (optional)
+--model-type          Classifier type: lstm (default) or mlp
+-e                    Execution site name (default: condorpool)
+-o                    Output workflow file (default: workflow.yml)
 ```
+
+## GPU Acceleration
+
+The `train_model` and `classify_seaice` stages are GPU-accelerated using
+TensorFlow with CUDA. The workflow requests 1 GPU per job via HTCondor
+(`request_gpus=1`) and uses Singularity `--nv` for NVIDIA GPU passthrough.
+
+### Requirements
+
+- NVIDIA GPU with CUDA 12.3+ compatible drivers on worker nodes
+- Singularity/Apptainer with `--nv` support
+
+The container image (`kthare10/seaice-icesat2:latest`) is built on
+`nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` with `tensorflow[and-cuda]`.
+If no GPU is available, TensorFlow falls back to CPU automatically.
 
 ## Scientific Details
 
@@ -80,8 +120,8 @@ pegasus-status <run-dir>
 
 ### Model Architecture
 
-**LSTM**: 1 LSTM layer (16 units, ELU) + 7 Dense layers → softmax(3)
-**MLP**: Dense(32, ReLU) → Dense(3, softmax)
+**LSTM**: 1 LSTM layer (16 units, ELU) + 7 Dense layers -> softmax(3)
+**MLP**: Dense(32, ReLU) -> Dense(3, softmax)
 
 Both use focal loss for class imbalance and Adam optimizer (lr=0.003).
 
@@ -95,13 +135,14 @@ Both use focal loss for class imbalance and Adam optimizer (lr=0.003).
 
 ## Container Image
 
-Build the Docker image:
+Build the GPU-enabled Docker image:
 
 ```bash
 docker build -t kthare10/seaice-icesat2:latest -f Docker/Seaice_Dockerfile .
 ```
 
-The workflow uses Singularity to pull from Docker Hub at runtime.
+The workflow uses Singularity to pull from Docker Hub at runtime. GPU stages
+use `--nv` for NVIDIA device passthrough.
 
 ## Output Files
 

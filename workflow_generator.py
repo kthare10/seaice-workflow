@@ -117,13 +117,21 @@ class SeaIceWorkflow:
         logger.info("Creating transformation catalog")
         self.tc = TransformationCatalog()
 
-        # Container - use Singularity with docker:// URL
+        # CPU container for non-GPU stages
         seaice_container = Container(
             "seaice_container",
             container_type=Container.SINGULARITY,
             image="docker://kthare10/seaice-icesat2:latest",
             image_site="docker_hub",
         )
+
+        # GPU container for training and classification (--nv enables NVIDIA GPU passthrough)
+        seaice_gpu_container = Container(
+            "seaice_gpu_container",
+            container_type=Container.SINGULARITY,
+            image="docker://kthare10/seaice-icesat2:latest",
+            image_site="docker_hub",
+        ).add_env(SINGULARITY_ARGS="--nv")
 
         # Transformations
         download_atl03 = Transformation(
@@ -158,21 +166,24 @@ class SeaIceWorkflow:
             container=seaice_container,
         ).add_pegasus_profile(memory="4 GB")
 
+        # GPU-accelerated stages: train_model and classify_seaice
         train_model = Transformation(
             "train_model",
             site=exec_site_name,
             pfn=os.path.join(self.wf_dir, "bin/train_model.py"),
             is_stageable=True,
-            container=seaice_container,
-        ).add_pegasus_profile(memory="16 GB")
+            container=seaice_gpu_container,
+        ).add_pegasus_profile(memory="16 GB"
+        ).add_condor_profile(request_gpus=1)
 
         classify_seaice = Transformation(
             "classify_seaice",
             site=exec_site_name,
             pfn=os.path.join(self.wf_dir, "bin/classify_seaice.py"),
             is_stageable=True,
-            container=seaice_container,
-        ).add_pegasus_profile(memory="8 GB")
+            container=seaice_gpu_container,
+        ).add_pegasus_profile(memory="8 GB"
+        ).add_condor_profile(request_gpus=1)
 
         calculate_freeboard = Transformation(
             "calculate_freeboard",
@@ -190,7 +201,7 @@ class SeaIceWorkflow:
             container=seaice_container,
         ).add_pegasus_profile(memory="4 GB")
 
-        self.tc.add_containers(seaice_container)
+        self.tc.add_containers(seaice_container, seaice_gpu_container)
         self.tc.add_transformations(
             download_atl03,
             download_sentinel2,
@@ -206,10 +217,9 @@ class SeaIceWorkflow:
         """Create replica catalog."""
         logger.info("Creating replica catalog")
         self.rc = ReplicaCatalog()
-        # No input files needed - download scripts fetch from APIs
 
     def create_workflow(self, region, start_date, end_date, granule_id=None,
-                        model_type="lstm"):
+                        model_type="lstm", earthdata_token=None):
         """Create the workflow DAG."""
         logger.info("Creating workflow DAG")
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
@@ -246,6 +256,8 @@ class SeaIceWorkflow:
             .add_args(*download_atl03_args)
             .add_outputs(atl03_data, stage_out=True, register_replica=False)
         )
+        if earthdata_token:
+            download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
         self.wf.add_jobs(download_atl03_job)
 
         # Job 2: Download Sentinel-2 (parallel with ATL03 download)
@@ -449,6 +461,12 @@ Available regions:
         default="lstm",
         help="Classifier model type (default: lstm)"
     )
+    parser.add_argument(
+        "--earthdata-token",
+        type=str,
+        default=os.environ.get("EARTHDATA_TOKEN"),
+        help="NASA Earthdata bearer token (default: $EARTHDATA_TOKEN env var)"
+    )
 
     args = parser.parse_args()
 
@@ -465,6 +483,13 @@ Available regions:
         logger.error(f"Invalid region: {args.region}. Valid regions: {valid_regions}")
         sys.exit(1)
 
+    if not args.earthdata_token:
+        logger.warning(
+            "No Earthdata token provided (--earthdata-token or $EARTHDATA_TOKEN). "
+            "download_atl03 will fail without NASA Earthdata credentials. "
+            "Generate a token at: https://urs.earthdata.nasa.gov/users/<username>/user_tokens"
+        )
+
     logger.info("=" * 70)
     logger.info("SEA ICE WORKFLOW GENERATOR")
     logger.info("=" * 70)
@@ -473,6 +498,7 @@ Available regions:
     logger.info(f"Model type: {args.model_type}")
     if args.granule_id:
         logger.info(f"Granule ID: {args.granule_id}")
+    logger.info(f"Earthdata token: {'provided' if args.earthdata_token else 'NOT SET'}")
     logger.info(f"Execution site: {args.execution_site_name}")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
@@ -500,6 +526,7 @@ Available regions:
             end_date=args.end_date,
             granule_id=args.granule_id,
             model_type=args.model_type,
+            earthdata_token=args.earthdata_token,
         )
 
         workflow.write()
