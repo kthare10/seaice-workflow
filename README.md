@@ -37,34 +37,44 @@ download_sentinel2 ──┘
 
 ### NASA Earthdata Credentials
 
-The `download_atl03` stage authenticates with NASA Earthdata using username/password
-passed via `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` environment variables.
+The `download_atl03` stage authenticates with NASA Earthdata. Two methods are supported:
+
+**Option 1: Bearer token (recommended for FABRIC)**
+
+Pre-generate a token from a machine that can reach `urs.earthdata.nasa.gov`:
 
 1. Create an account at <https://urs.earthdata.nasa.gov/>
-2. Pass credentials to the workflow generator via CLI args or environment variables:
+2. Generate a token at `https://urs.earthdata.nasa.gov/users/<username>/user_tokens`
+3. Pass it via `--earthdata-token` or `EARTHDATA_TOKEN` env var:
+
+```bash
+export EARTHDATA_TOKEN="your_token_here"
+```
+
+This bypasses the login endpoint, which is useful on networks (like FABRIC)
+where `urs.earthdata.nasa.gov` is unreachable.
+
+**Option 2: Username/password**
 
 ```bash
 export EARTHDATA_USERNAME="your_username"
 export EARTHDATA_PASSWORD="your_password"
 ```
 
-The workflow generator will warn if credentials are not provided.
-
 ### Generate and Submit Workflow
 
 ```bash
-# Generate workflow DAG (credentials from env vars)
+# Generate workflow DAG (token from $EARTHDATA_TOKEN)
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-30 \
                               --output workflow.yml
 
-# Or pass credentials explicitly
+# Or pass token explicitly
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-30 \
-                              --earthdata-username "user" \
-                              --earthdata-password "pass" \
+                              --earthdata-token "your_token" \
                               --output workflow.yml
 
 # Submit to HTCondor
@@ -80,6 +90,7 @@ pegasus-status <run-dir>
 --region              Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
 --start-date          Start date (YYYY-MM-DD)
 --end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
+--earthdata-token     Pre-generated bearer token (default: $EARTHDATA_TOKEN)
 --earthdata-username  NASA Earthdata username (default: $EARTHDATA_USERNAME)
 --earthdata-password  NASA Earthdata password (default: $EARTHDATA_PASSWORD)
 --granule-id          Specific ATL03 granule ID (optional)
