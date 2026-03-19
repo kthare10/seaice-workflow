@@ -169,6 +169,37 @@ def overlay_labels(atl03_df, classification, transform, scene_crs, max_distance=
     return labels
 
 
+def _height_based_labeling(atl03_df):
+    """
+    Fallback labeling when no Sentinel-2 scenes overlap with ATL03 track.
+
+    Assigns labels based on photon height statistics:
+      0 = thick ice  (mean_h > 0.3)
+      1 = thin ice   (0.05 < mean_h <= 0.3)
+      2 = open water (mean_h <= 0.05)
+
+    Args:
+        atl03_df: DataFrame with ATL03 segment data (must have 'mean_h' column)
+
+    Returns:
+        DataFrame with 'label' column added
+    """
+    import numpy as np
+
+    df = atl03_df.copy()
+    labels = np.full(len(df), CLASS_OPEN_WATER, dtype=np.int8)
+    labels[df['mean_h'] > 0.05] = CLASS_THIN_ICE
+    labels[df['mean_h'] > 0.3] = CLASS_THICK_ICE
+    df['label'] = labels
+
+    logger.info(f"Height-based labeling: "
+                f"thick_ice={np.sum(labels == CLASS_THICK_ICE)}, "
+                f"thin_ice={np.sum(labels == CLASS_THIN_ICE)}, "
+                f"open_water={np.sum(labels == CLASS_OPEN_WATER)}")
+
+    return df
+
+
 def auto_label(atl03_input, sentinel2_input, output_file):
     """
     Full auto-labeling pipeline.
@@ -227,8 +258,8 @@ def auto_label(atl03_input, sentinel2_input, output_file):
     logger.info(f"Total labeled segments: {len(labeled_df):,} / {len(atl03_df):,}")
 
     if labeled_df.empty:
-        logger.error("No segments could be labeled")
-        sys.exit(1)
+        logger.warning("No S2 scenes overlap with ATL03 track — falling back to height-based labeling")
+        labeled_df = _height_based_labeling(atl03_df)
 
     labeled_df.to_csv(output_file, index=False)
     logger.info(f"Labeled data saved to {output_file}")

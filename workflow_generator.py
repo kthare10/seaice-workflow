@@ -10,7 +10,7 @@ from ICESat-2 ATL03 Data" (Iqrah et al., IPDPSW 2025)
 
 Pipeline stages:
 1. Download ICESat-2 ATL03 photon data from NASA Earthdata
-2. Download coincident Sentinel-2 imagery (parallel with step 1)
+2. Download coincident Sentinel-2 imagery (uses ATL03 track bbox for spatial filtering)
 3. Preprocess ATL03: filter photons, resample to 2m segments, compute features
 4. Auto-label: co-register S2 imagery with ATL03 tracks, overlay labels
 5. Train LSTM/MLP classifier on labeled data
@@ -201,6 +201,14 @@ class SeaIceWorkflow:
             container=seaice_container,
         ).add_pegasus_profile(memory="4 GB")
 
+        merge_classifications = Transformation(
+            "merge_classifications",
+            site=exec_site_name,
+            pfn=os.path.join(self.wf_dir, "bin/merge_classifications.py"),
+            is_stageable=True,
+            container=seaice_container,
+        ).add_pegasus_profile(memory="4 GB")
+
         self.tc.add_containers(seaice_container, seaice_gpu_container)
         self.tc.add_transformations(
             download_atl03,
@@ -211,6 +219,7 @@ class SeaIceWorkflow:
             classify_seaice,
             calculate_freeboard,
             visualize_results,
+            merge_classifications,
         )
 
     def create_replica_catalog(self, test_mode=False):
@@ -244,6 +253,7 @@ class SeaIceWorkflow:
 
         # Output files
         atl03_data = File("atl03_data.h5")
+        atl03_bbox = File("atl03_bbox.json")
         sentinel2_scenes = File("sentinel2_scenes.tar.gz")
         atl03_preprocessed = File("atl03_preprocessed.csv")
         labeled_data = File("labeled_data.csv")
@@ -280,6 +290,7 @@ class SeaIceWorkflow:
                 )
                 .add_args(*download_atl03_args)
                 .add_outputs(atl03_data, stage_out=True, register_replica=False)
+                .add_outputs(atl03_bbox, stage_out=False, register_replica=False)
             )
             if earthdata_token:
                 download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
@@ -290,9 +301,9 @@ class SeaIceWorkflow:
                 )
             self.wf.add_jobs(download_atl03_job)
 
-            # Job 2: Download Sentinel-2 (parallel with ATL03 download)
+            # Job 2: Download Sentinel-2 (depends on ATL03 download for track bbox)
             download_sentinel2_args = [
-                "--region", region,
+                "--bbox-file", atl03_bbox,
                 "--start-date", start_date,
                 "--end-date", end_date,
                 "--output", sentinel2_scenes,
@@ -307,6 +318,7 @@ class SeaIceWorkflow:
                     node_label="download_sentinel2",
                 )
                 .add_args(*download_sentinel2_args)
+                .add_inputs(atl03_bbox)
                 .add_outputs(sentinel2_scenes, stage_out=True, register_replica=False)
             )
             self.wf.add_jobs(download_sentinel2_job)
@@ -369,21 +381,70 @@ class SeaIceWorkflow:
         self.wf.add_jobs(train_job)
 
         # Job 6: Classify sea ice
-        classify_job = (
-            Job(
-                "classify_seaice",
-                _id="classify_seaice",
-                node_label="classify_seaice",
+        # Determine fan-out width: test_mode -> 2, max_granules set -> that value, else single job
+        num_classify_jobs = None
+        if test_mode:
+            num_classify_jobs = 2
+        elif max_granules is not None:
+            num_classify_jobs = max_granules
+
+        if num_classify_jobs is not None and num_classify_jobs > 1:
+            # Fan-out: one classify job per granule
+            per_granule_files = []
+            for i in range(num_classify_jobs):
+                granule_id_str = f"granule_{i:04d}"
+                per_granule_file = File(f"classification_{granule_id_str}.csv")
+                per_granule_files.append(per_granule_file)
+
+                classify_job_i = (
+                    Job(
+                        "classify_seaice",
+                        _id=f"classify_seaice_{i}",
+                        node_label=f"classify_seaice_{i}",
+                    )
+                    .add_args(
+                        "--input", atl03_preprocessed,
+                        "--model", model_file,
+                        "--granule", granule_id_str,
+                        "--output", per_granule_file,
+                    )
+                    .add_inputs(atl03_preprocessed, model_file)
+                    .add_outputs(per_granule_file, stage_out=False, register_replica=False)
+                )
+                self.wf.add_jobs(classify_job_i)
+
+            # Fan-in: merge per-granule results
+            merge_args = ["--output", classification_results, "--inputs"]
+            merge_args.extend(per_granule_files)
+
+            merge_job = (
+                Job(
+                    "merge_classifications",
+                    _id="merge_classifications",
+                    node_label="merge_classifications",
+                )
+                .add_args(*merge_args)
+                .add_inputs(*per_granule_files)
+                .add_outputs(classification_results, stage_out=True, register_replica=False)
             )
-            .add_args(
-                "--input", atl03_preprocessed,
-                "--model", model_file,
-                "--output", classification_results,
+            self.wf.add_jobs(merge_job)
+        else:
+            # Single classify job (backward compatible)
+            classify_job = (
+                Job(
+                    "classify_seaice",
+                    _id="classify_seaice",
+                    node_label="classify_seaice",
+                )
+                .add_args(
+                    "--input", atl03_preprocessed,
+                    "--model", model_file,
+                    "--output", classification_results,
+                )
+                .add_inputs(atl03_preprocessed, model_file)
+                .add_outputs(classification_results, stage_out=True, register_replica=False)
             )
-            .add_inputs(atl03_preprocessed, model_file)
-            .add_outputs(classification_results, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(classify_job)
+            self.wf.add_jobs(classify_job)
 
         # Job 7: Calculate freeboard
         freeboard_job = (

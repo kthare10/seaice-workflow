@@ -164,8 +164,13 @@ Examples:
         """
     )
 
-    parser.add_argument("--region", type=str, required=True,
+    parser.add_argument("--region", type=str, default=None,
                         help="Region name (ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean)")
+    parser.add_argument("--bbox", type=str, default=None,
+                        help="Bounding box as min_lon,min_lat,max_lon,max_lat (overrides --region)")
+    parser.add_argument("--bbox-file", type=str, default=None,
+                        help="JSON file with bounding box (keys: min_lon, min_lat, max_lon, max_lat). "
+                             "Overrides --region and --bbox.")
     parser.add_argument("--start-date", type=str, required=True,
                         help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, default=None,
@@ -184,9 +189,26 @@ Examples:
         end = start + timedelta(days=30)
         args.end_date = end.strftime("%Y-%m-%d")
 
+    # Determine region: --bbox-file > --bbox > --region
+    if args.bbox_file:
+        import json
+        with open(args.bbox_file) as f:
+            bbox_data = json.load(f)
+        region = (bbox_data["min_lon"], bbox_data["min_lat"],
+                  bbox_data["max_lon"], bbox_data["max_lat"])
+        logger.info(f"Using bounding box from {args.bbox_file}: {region}")
+    elif args.bbox:
+        region = tuple(float(x) for x in args.bbox.split(","))
+        if len(region) != 4:
+            parser.error("--bbox must have 4 comma-separated values: min_lon,min_lat,max_lon,max_lat")
+    elif args.region:
+        region = args.region
+    else:
+        parser.error("Either --region, --bbox, or --bbox-file is required")
+
     try:
         download_sentinel2(
-            region=args.region,
+            region=region,
             start_date=args.start_date,
             end_date=args.end_date,
             output_file=args.output,

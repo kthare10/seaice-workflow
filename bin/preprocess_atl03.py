@@ -63,10 +63,10 @@ def extract_beam_photons(h5_file, granule_key, beam):
     lon_ph = beam_grp['lon_ph'][:]
     signal_conf = beam_grp['signal_conf_ph'][:]
 
-    # Handle multi-dimensional signal_conf (surface type x photons)
-    # Sea ice surface type is index 4 in ATL03
+    # Handle multi-dimensional signal_conf (photons x surface_types)
+    # ATL03 surface types: 0=land, 1=ocean, 2=sea_ice, 3=land_ice, 4=inland_water
     if signal_conf.ndim == 2:
-        signal_conf = signal_conf[4, :]  # Sea ice surface type
+        signal_conf = signal_conf[:, 2]  # Sea ice surface type
     elif signal_conf.ndim == 1:
         pass  # Already 1D
     else:

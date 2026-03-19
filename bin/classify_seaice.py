@@ -73,7 +73,8 @@ def prepare_lstm_sequences(X, seq_length=SEQUENCE_LENGTH):
     return np.array(X_seq), np.array(indices)
 
 
-def classify_seaice(input_file, model_path, output_file, batch_size=256):
+def classify_seaice(input_file, model_path, output_file, batch_size=256,
+                     granule=None):
     """
     Run sea ice classification on preprocessed ATL03 data.
 
@@ -82,6 +83,7 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256):
         model_path: Path to trained model file
         output_file: Path to output classification CSV
         batch_size: Inference batch size
+        granule: If set, filter input to rows matching this granule ID
     """
     import numpy as np
     import pandas as pd
@@ -99,6 +101,20 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256):
     logger.info(f"Loading preprocessed data from {input_file}")
     df = pd.read_csv(input_file)
     logger.info(f"Total segments: {len(df):,}")
+
+    # Filter to a single granule when requested
+    if granule is not None:
+        if 'granule' not in df.columns:
+            logger.error("--granule specified but input CSV has no 'granule' column")
+            sys.exit(1)
+        df = df[df['granule'] == granule].reset_index(drop=True)
+        logger.info(f"Filtered to granule '{granule}': {len(df):,} segments")
+        if len(df) == 0:
+            logger.warning(f"No rows match granule '{granule}', writing empty output")
+            pd.DataFrame(columns=pd.read_csv(input_file, nrows=0).columns.tolist()
+                         + ['predicted_class', 'prediction_prob', 'predicted_label']
+                         ).to_csv(output_file, index=False)
+            return
 
     # Verify required columns
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
@@ -190,11 +206,13 @@ Examples:
                         help="Trained model file (HDF5)")
     parser.add_argument("--output", type=str, default="classification_results.csv",
                         help="Output classification CSV (default: classification_results.csv)")
+    parser.add_argument("--granule", type=str, default=None,
+                        help="Process only this granule (filter input by 'granule' column)")
 
     args = parser.parse_args()
 
     try:
-        classify_seaice(args.input, args.model, args.output)
+        classify_seaice(args.input, args.model, args.output, granule=args.granule)
         logger.info("Classification completed successfully")
     except Exception as e:
         logger.error(f"Failed to classify sea ice: {e}")
