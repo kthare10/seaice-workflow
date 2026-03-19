@@ -223,9 +223,10 @@ TensorFlow with CUDA. The workflow requests 1 GPU per job via HTCondor
 - NVIDIA GPU with CUDA 12.3+ compatible drivers on worker nodes
 - Singularity/Apptainer with `--nv` support
 
-The container image (`kthare10/seaice-icesat2:latest`) is built on
-`nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` with `tensorflow[and-cuda]`.
+The GPU container image (`kthare10/seaice-icesat2-gpu:latest`) is built on
+`nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` with `tensorflow`.
 If no GPU is available, TensorFlow falls back to CPU automatically.
+Non-GPU stages use the lightweight `kthare10/seaice-icesat2-cpu:latest` image.
 
 ## Scientific Details
 
@@ -258,12 +259,21 @@ Both use focal loss for class imbalance and Adam optimizer (lr=0.003).
 - Linear interpolation where no open water exists
 - Freeboard = segment_elevation - local_sea_surface
 
-## Container Image
+## Container Images
 
-Build the GPU-enabled Docker image:
+The workflow uses two container images to minimize footprint. Only the GPU
+image includes TensorFlow and CUDA libraries; the CPU image is much smaller.
+
+**CPU image** (download, preprocess, label, merge, freeboard, visualize):
 
 ```bash
-docker build -t kthare10/seaice-icesat2:latest -f Docker/Seaice_Dockerfile .
+docker build -t kthare10/seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
+```
+
+**GPU image** (train, classify):
+
+```bash
+docker build -t kthare10/seaice-icesat2-gpu:latest -f Docker/Seaice_Dockerfile .
 ```
 
 The workflow uses Singularity to pull from Docker Hub at runtime. GPU stages

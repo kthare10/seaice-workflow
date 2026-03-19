@@ -117,11 +117,11 @@ class SeaIceWorkflow:
         logger.info("Creating transformation catalog")
         self.tc = TransformationCatalog()
 
-        # CPU container for non-GPU stages
+        # CPU container for non-GPU stages (lightweight, no TensorFlow)
         seaice_container = Container(
             "seaice_container",
             container_type=Container.SINGULARITY,
-            image="docker://kthare10/seaice-icesat2:latest",
+            image="docker://kthare10/seaice-icesat2-cpu:latest",
             image_site="docker_hub",
         )
 
@@ -129,7 +129,7 @@ class SeaIceWorkflow:
         seaice_gpu_container = Container(
             "seaice_gpu_container",
             container_type=Container.SINGULARITY,
-            image="docker://kthare10/seaice-icesat2:latest",
+            image="docker://kthare10/seaice-icesat2-gpu:latest",
             image_site="docker_hub",
         ).add_env(SINGULARITY_ARGS="--nv")
 
