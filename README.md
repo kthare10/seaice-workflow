@@ -1,5 +1,8 @@
 # Sea Ice Classification & Freeboard from ICESat-2 ATL03
 
+**Authors:** Claude and Komal Thareja
+**License:** [MIT](LICENSE)
+
 A Pegasus workflow for scalable, higher resolution polar sea ice classification
 and freeboard calculation from ICESat-2 ATL03 photon-level data.
 
