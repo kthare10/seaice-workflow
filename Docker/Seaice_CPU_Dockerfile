@@ -6,7 +6,7 @@
 #   docker build -t kthare10/seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
 
 # --- Builder stage ---
-FROM python:3.10-slim AS builder
+FROM python:3.10-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libhdf5-dev libgeos-dev libproj-dev && \
@@ -17,10 +17,10 @@ RUN pip install --no-cache-dir --prefix=/install \
     rasterio pyproj earthaccess planetary-computer pystac-client requests
 
 # --- Runtime stage ---
-FROM python:3.10-slim
+FROM python:3.10-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libhdf5-103 libgeos3.10.2 libproj22 && \
+    libhdf5-103-1 libgeos3.11.1 libproj25 curl wget && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local
