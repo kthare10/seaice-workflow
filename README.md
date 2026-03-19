@@ -12,18 +12,18 @@ Calculation from ICESat-2 ATL03 Data"* (Iqrah et al., IPDPSW 2025)
 
 ```
 Full mode (single classify job):
-  download_atl03 ──┬──> preprocess_atl03 ──┐
+  download_atl03 ──┬──> preprocess_atl03 ───┐
                    │                        ├──> auto_label ──> train_model [GPU] ──> classify_seaice [GPU] ──> calculate_freeboard ──> visualize_results
                    └──> download_sentinel2 ─┘
                         (uses ATL03 track bbox)
 
 Full mode with --max-granules N (parallel classify jobs):
-  download_atl03 ──┬──> preprocess_atl03 ──┐                        ┌─ classify_seaice_0 [GPU] ─┐
-                   │                        ├──> auto_label ──> train ├─ classify_seaice_1 [GPU] ─├─> merge ──> calculate_freeboard ──> visualize
+  download_atl03 ──┬──> preprocess_atl03 ───┐                        ┌─ classify_seaice_0 [GPU] ─┐
+                   │                        ├──> auto_label ──> train├─ classify_seaice_1 [GPU] ─├─> merge ──> calculate_freeboard ──> visualize
                    └──> download_sentinel2 ─┘                        └─ classify_seaice_N [GPU] ─┘
 
 Test mode (--test-mode, 2 parallel classify jobs):
-  [test_data/atl03_data.h5] ──> preprocess_atl03 ──┐            ┌─ classify_seaice_0 [GPU] ─┐
+  [test_data/atl03_data.h5] ──> preprocess_atl03 ───┐            ┌─ classify_seaice_0 [GPU] ─┐
   [test_data/labeled_data.csv] ────────────────────>├──> train ──├─ classify_seaice_1 [GPU] ─├──> merge ──> calculate_freeboard ──> visualize
                                                                  └───────────────────────────┘
 ```
@@ -189,7 +189,7 @@ To run with real data but limit download volume for faster testing, use
 python workflow_generator.py --region ross_sea \
                               --start-date 2019-11-01 \
                               --end-date 2019-11-07 \
-                              --max-granules 2 \
+                              --max-granules 3 \
                               --max-scenes 3 \
                               --output workflow_limited.yml
 ```
