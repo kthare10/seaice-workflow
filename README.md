@@ -72,7 +72,7 @@ Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-te
    git clone <repo-url> && cd seaice-workflow
    ```
 
-5. Follow the [Generate and Submit Workflow](#generate-and-submit-workflow) instructions below.
+5. Open **`Access-SeaIce-workflow.ipynb`** in Jupyter and follow the cells to configure, generate, submit, monitor, and inspect results — or use the [CLI instructions](#generate-and-submit-workflow) below.
 
 > **Note:** FABRIC worker nodes can be provisioned with NVIDIA GPUs (e.g., RTX6000, A30, A40) for the `train_model` and `classify_seaice` stages. Request GPU components in the notebook when creating your slice.
 
@@ -90,14 +90,11 @@ Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-te
    git clone <repo-url> && cd seaice-workflow
    ```
 
-4. **To get started quickly**, submit workflows to the built-in test pool — no allocation needed:
+4. Open **`Access-SeaIce-workflow.ipynb`** — the notebook walks through configuration, workflow generation, submission, monitoring, and result visualization interactively.
 
-   ```bash
-   pegasus-plan --submit -s condorpool -o local workflow.yml
-   ```
+5. **To get started quickly**, the notebook submits to the built-in test pool — no allocation needed.
 
-5. **To scale up**, request an [ACCESS allocation](https://allocations.access-ci.org/) and use **HTCondor Annex** to provision pilot jobs on allocated resources (see the [ACCESS Pegasus examples](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples)).
-6. Follow the [Generate and Submit Workflow](#generate-and-submit-workflow) instructions below.
+6. **To scale up**, request an [ACCESS allocation](https://allocations.access-ci.org/) and use **HTCondor Annex** to provision pilot jobs on allocated resources (see the [ACCESS Pegasus examples](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples)).
 
 > **Note:** The test pool has limited resources and no GPUs. For the GPU-accelerated `train_model` and `classify_seaice` stages, provision GPU nodes via HTCondor Annex with an ACCESS allocation.
 
@@ -112,6 +109,8 @@ Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-te
 - NASA Earthdata account (see below)
 
 Both execution environments above (FABRIC, ACCESS Pegasus) satisfy these prerequisites automatically.
+
+> **Recommended:** Use the **`Access-SeaIce-workflow.ipynb`** Jupyter notebook for an interactive, guided experience. The CLI instructions below are equivalent.
 
 ### NASA Earthdata Credentials
 
