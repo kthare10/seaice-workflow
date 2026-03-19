@@ -1,0 +1,32 @@
+# Lightweight CPU image for non-TensorFlow sea ice workflow jobs:
+#   download_atl03, download_sentinel2, preprocess_atl03, auto_label,
+#   merge_classifications, calculate_freeboard, visualize_results
+#
+# Build:
+#   docker build -t kthare10/seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
+
+# --- Builder stage ---
+FROM python:3.10-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libhdf5-dev libgeos-dev libproj-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --prefix=/install \
+    numpy pandas scipy scikit-learn h5py matplotlib \
+    rasterio pyproj earthaccess planetary-computer pystac-client requests
+
+# --- Runtime stage ---
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libhdf5-103 libgeos3.10.2 libproj22 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/bin/bash"]
