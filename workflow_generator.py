@@ -4,6 +4,9 @@
 Pegasus workflow generator for sea ice classification and freeboard calculation
 from ICESat-2 ATL03 data.
 
+Authors: Claude and Komal Thareja
+License: MIT
+
 This script generates a Pegasus workflow implementing the pipeline from:
 "Scalable Higher Resolution Polar Sea Ice Classification and Freeboard Calculation
 from ICESat-2 ATL03 Data" (Iqrah et al., IPDPSW 2025)
