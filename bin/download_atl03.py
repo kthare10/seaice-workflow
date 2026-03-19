@@ -36,7 +36,7 @@ REGIONS = {
 }
 
 
-def download_atl03(region, start_date, end_date, output_file, granule_id=None):
+def download_atl03(region, start_date, end_date, output_file, granule_id=None, max_granules=None):
     """
     Download ATL03 granules from NASA Earthdata.
 
@@ -100,6 +100,10 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
 
     logger.info(f"Found {len(results)} ATL03 granules")
 
+    if max_granules and len(results) > max_granules:
+        logger.info(f"Limiting to {max_granules} granules (--max-granules)")
+        results = results[:max_granules]
+
     if not results:
         logger.error("No ATL03 granules found for the specified criteria")
         sys.exit(1)
@@ -121,6 +125,12 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None):
                 continue
             url = urls[0]
             filename = Path(url).name
+            # Skip already-downloaded granules (resume after partial failure)
+            if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                logger.info(f"  [{i+1}/{len(results)}] Skipping {filename} (already exists)")
+                downloaded_files.append(filename)
+                continue
+
             logger.info(f"  [{i+1}/{len(results)}] Downloading {filename}...")
 
             for attempt in range(1, max_retries + 1):
@@ -254,6 +264,8 @@ Examples:
                         help="End date (YYYY-MM-DD), defaults to start_date + 30 days")
     parser.add_argument("--granule-id", type=str, default=None,
                         help="Specific ATL03 granule ID (optional)")
+    parser.add_argument("--max-granules", type=int, default=None,
+                        help="Maximum number of granules to download (default: all)")
     parser.add_argument("--output", type=str, default="atl03_data.h5",
                         help="Output HDF5 file (default: atl03_data.h5)")
 
@@ -271,6 +283,7 @@ Examples:
             end_date=args.end_date,
             output_file=args.output,
             granule_id=args.granule_id,
+            max_granules=args.max_granules,
         )
         logger.info("ATL03 download completed successfully")
     except Exception as e:

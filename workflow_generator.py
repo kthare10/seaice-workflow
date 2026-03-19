@@ -213,14 +213,31 @@ class SeaIceWorkflow:
             visualize_results,
         )
 
-    def create_replica_catalog(self):
+    def create_replica_catalog(self, test_mode=False):
         """Create replica catalog."""
         logger.info("Creating replica catalog")
         self.rc = ReplicaCatalog()
 
+        if test_mode:
+            # Register synthetic test data so download jobs can be skipped
+            test_data_dir = os.path.join(self.wf_dir, "test_data")
+            atl03_path = os.path.join(test_data_dir, "atl03_data.h5")
+            labeled_path = os.path.join(test_data_dir, "labeled_data.csv")
+
+            if not os.path.exists(atl03_path):
+                logger.warning(
+                    f"Test data not found at {test_data_dir}. "
+                    "Run 'python generate_test_data.py' first."
+                )
+
+            self.rc.add_replica("local", "atl03_data.h5", "file://" + atl03_path)
+            self.rc.add_replica("local", "labeled_data.csv", "file://" + labeled_path)
+            logger.info(f"Registered test data from {test_data_dir}")
+
     def create_workflow(self, region, start_date, end_date, granule_id=None,
                         model_type="lstm", earthdata_token=None,
-                        earthdata_username=None, earthdata_password=None):
+                        earthdata_username=None, earthdata_password=None,
+                        test_mode=False, max_granules=None, max_scenes=None):
         """Create the workflow DAG."""
         logger.info("Creating workflow DAG")
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
@@ -238,50 +255,61 @@ class SeaIceWorkflow:
         freeboard_profile = File("freeboard_profile.png")
         summary_stats = File("summary_statistics.json")
 
-        # Job 1: Download ATL03 data
-        download_atl03_args = [
-            "--region", region,
-            "--start-date", start_date,
-            "--end-date", end_date,
-            "--output", atl03_data
-        ]
-        if granule_id:
-            download_atl03_args.extend(["--granule-id", granule_id])
+        if test_mode:
+            # In test mode, skip downloads and use pre-generated synthetic data
+            # Files are registered in the replica catalog by create_replica_catalog()
+            logger.info("TEST MODE: Skipping download jobs, using synthetic test data")
+        else:
+            # Job 1: Download ATL03 data
+            download_atl03_args = [
+                "--region", region,
+                "--start-date", start_date,
+                "--end-date", end_date,
+                "--output", atl03_data
+            ]
+            if granule_id:
+                download_atl03_args.extend(["--granule-id", granule_id])
+            if max_granules:
+                download_atl03_args.extend(["--max-granules", str(max_granules)])
 
-        download_atl03_job = (
-            Job(
-                "download_atl03",
-                _id="download_atl03",
-                node_label="download_atl03",
+            download_atl03_job = (
+                Job(
+                    "download_atl03",
+                    _id="download_atl03",
+                    node_label="download_atl03",
+                )
+                .add_args(*download_atl03_args)
+                .add_outputs(atl03_data, stage_out=True, register_replica=False)
             )
-            .add_args(*download_atl03_args)
-            .add_outputs(atl03_data, stage_out=True, register_replica=False)
-        )
-        if earthdata_token:
-            download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
-        elif earthdata_username and earthdata_password:
-            download_atl03_job.add_env(
-                EARTHDATA_USERNAME=earthdata_username,
-                EARTHDATA_PASSWORD=earthdata_password,
-            )
-        self.wf.add_jobs(download_atl03_job)
+            if earthdata_token:
+                download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
+            elif earthdata_username and earthdata_password:
+                download_atl03_job.add_env(
+                    EARTHDATA_USERNAME=earthdata_username,
+                    EARTHDATA_PASSWORD=earthdata_password,
+                )
+            self.wf.add_jobs(download_atl03_job)
 
-        # Job 2: Download Sentinel-2 (parallel with ATL03 download)
-        download_sentinel2_job = (
-            Job(
-                "download_sentinel2",
-                _id="download_sentinel2",
-                node_label="download_sentinel2",
-            )
-            .add_args(
+            # Job 2: Download Sentinel-2 (parallel with ATL03 download)
+            download_sentinel2_args = [
                 "--region", region,
                 "--start-date", start_date,
                 "--end-date", end_date,
                 "--output", sentinel2_scenes,
+            ]
+            if max_scenes:
+                download_sentinel2_args.extend(["--max-scenes", str(max_scenes)])
+
+            download_sentinel2_job = (
+                Job(
+                    "download_sentinel2",
+                    _id="download_sentinel2",
+                    node_label="download_sentinel2",
+                )
+                .add_args(*download_sentinel2_args)
+                .add_outputs(sentinel2_scenes, stage_out=True, register_replica=False)
             )
-            .add_outputs(sentinel2_scenes, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(download_sentinel2_job)
+            self.wf.add_jobs(download_sentinel2_job)
 
         # Job 3: Preprocess ATL03
         preprocess_job = (
@@ -299,22 +327,27 @@ class SeaIceWorkflow:
         )
         self.wf.add_jobs(preprocess_job)
 
-        # Job 4: Auto-label with Sentinel-2
-        auto_label_job = (
-            Job(
-                "auto_label",
-                _id="auto_label",
-                node_label="auto_label",
+        if test_mode:
+            # In test mode, skip auto_label — labeled_data.csv is provided
+            # via the replica catalog from generate_test_data.py
+            logger.info("TEST MODE: Skipping auto_label job, using pre-built labeled_data.csv")
+        else:
+            # Job 4: Auto-label with Sentinel-2
+            auto_label_job = (
+                Job(
+                    "auto_label",
+                    _id="auto_label",
+                    node_label="auto_label",
+                )
+                .add_args(
+                    "--atl03-input", atl03_preprocessed,
+                    "--sentinel2-input", sentinel2_scenes,
+                    "--output", labeled_data,
+                )
+                .add_inputs(atl03_preprocessed, sentinel2_scenes)
+                .add_outputs(labeled_data, stage_out=True, register_replica=False)
             )
-            .add_args(
-                "--atl03-input", atl03_preprocessed,
-                "--sentinel2-input", sentinel2_scenes,
-                "--output", labeled_data,
-            )
-            .add_inputs(atl03_preprocessed, sentinel2_scenes)
-            .add_outputs(labeled_data, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(auto_label_job)
+            self.wf.add_jobs(auto_label_job)
 
         # Job 5: Train model
         train_job = (
@@ -445,8 +478,8 @@ Available regions:
     parser.add_argument(
         "--start-date",
         type=str,
-        required=True,
-        help="Start date (YYYY-MM-DD)"
+        default=None,
+        help="Start date (YYYY-MM-DD). Required unless --test-mode is used."
     )
     parser.add_argument(
         "--end-date",
@@ -466,6 +499,24 @@ Available regions:
         choices=["lstm", "mlp"],
         default="lstm",
         help="Classifier model type (default: lstm)"
+    )
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Use synthetic test data instead of downloading from NASA/Planetary Computer. "
+             "Skips download and auto-label jobs. Run 'python generate_test_data.py' first."
+    )
+    parser.add_argument(
+        "--max-granules",
+        type=int,
+        default=None,
+        help="Maximum number of ATL03 granules to download (limits download size)"
+    )
+    parser.add_argument(
+        "--max-scenes",
+        type=int,
+        default=None,
+        help="Maximum number of Sentinel-2 scenes to download (limits download size)"
     )
     parser.add_argument(
         "--earthdata-token",
@@ -489,6 +540,12 @@ Available regions:
 
     args = parser.parse_args()
 
+    # In test mode, start-date is optional
+    if not args.test_mode and not args.start_date:
+        parser.error("--start-date is required unless --test-mode is used")
+    if args.test_mode and not args.start_date:
+        args.start_date = "2019-11-01"  # default for test mode
+
     # Handle default end date
     if not args.end_date:
         start = datetime.strptime(args.start_date, "%Y-%m-%d")
@@ -502,7 +559,7 @@ Available regions:
         logger.error(f"Invalid region: {args.region}. Valid regions: {valid_regions}")
         sys.exit(1)
 
-    if not args.earthdata_token and (not args.earthdata_username or not args.earthdata_password):
+    if not args.test_mode and not args.earthdata_token and (not args.earthdata_username or not args.earthdata_password):
         logger.warning(
             "No Earthdata credentials provided. Provide either:\n"
             "  --earthdata-token / $EARTHDATA_TOKEN (preferred for FABRIC), or\n"
@@ -518,7 +575,14 @@ Available regions:
     logger.info(f"Model type: {args.model_type}")
     if args.granule_id:
         logger.info(f"Granule ID: {args.granule_id}")
-    logger.info(f"Earthdata auth: {'token' if args.earthdata_token else 'username/password' if args.earthdata_username else 'NOT SET'}")
+    if args.test_mode:
+        logger.info("Mode: TEST (synthetic data, no downloads)")
+    else:
+        logger.info(f"Earthdata auth: {'token' if args.earthdata_token else 'username/password' if args.earthdata_username else 'NOT SET'}")
+        if args.max_granules:
+            logger.info(f"Max ATL03 granules: {args.max_granules}")
+        if args.max_scenes:
+            logger.info(f"Max Sentinel-2 scenes: {args.max_scenes}")
     logger.info(f"Execution site: {args.execution_site_name}")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
@@ -537,7 +601,7 @@ Available regions:
         workflow.create_transformation_catalog(args.execution_site_name)
 
         logger.info("Creating replica catalog...")
-        workflow.create_replica_catalog()
+        workflow.create_replica_catalog(test_mode=args.test_mode)
 
         logger.info("Creating sea ice workflow DAG...")
         workflow.create_workflow(
@@ -549,6 +613,9 @@ Available regions:
             earthdata_token=args.earthdata_token,
             earthdata_username=args.earthdata_username,
             earthdata_password=args.earthdata_password,
+            test_mode=args.test_mode,
+            max_granules=args.max_granules,
+            max_scenes=args.max_scenes,
         )
 
         workflow.write()
