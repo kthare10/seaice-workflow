@@ -8,6 +8,8 @@ Calculation from ICESat-2 ATL03 Data"* (Iqrah et al., IPDPSW 2025)
 
 ## Pipeline Overview
 
+![Sea Ice Workflow DAG](images/workflow.png)
+
 ```
 Full mode (single classify job):
   download_atl03 ──┬──> preprocess_atl03 ──┐
