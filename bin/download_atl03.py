@@ -36,6 +36,53 @@ REGIONS = {
 }
 
 
+def _write_track_bbox(h5_path, bbox_path="atl03_bbox.json", pad_deg=0.5):
+    """
+    Compute the bounding box of all photon tracks in an ATL03 HDF5 file
+    and write it to a JSON file for use by downstream jobs (e.g. S2 download).
+
+    Args:
+        h5_path: Path to the merged ATL03 HDF5 file
+        bbox_path: Output JSON path (default: atl03_bbox.json)
+        pad_deg: Degrees of padding around the track (default: 0.5)
+    """
+    import json
+
+    import h5py
+    import numpy as np
+
+    min_lat, max_lat = 90.0, -90.0
+    min_lon, max_lon = 180.0, -180.0
+
+    with h5py.File(h5_path, 'r') as h5:
+        for gname in h5.keys():
+            if not gname.startswith('granule_'):
+                continue
+            for beam in ['gt1l', 'gt2l', 'gt3l']:
+                lat_path = f"{gname}/{beam}/lat_ph"
+                lon_path = f"{gname}/{beam}/lon_ph"
+                if lat_path in h5 and lon_path in h5:
+                    lat = h5[lat_path][:]
+                    lon = h5[lon_path][:]
+                    min_lat = min(min_lat, float(np.min(lat)))
+                    max_lat = max(max_lat, float(np.max(lat)))
+                    min_lon = min(min_lon, float(np.min(lon)))
+                    max_lon = max(max_lon, float(np.max(lon)))
+
+    bbox = {
+        "min_lon": round(min_lon - pad_deg, 4),
+        "min_lat": round(min_lat - pad_deg, 4),
+        "max_lon": round(max_lon + pad_deg, 4),
+        "max_lat": round(max_lat + pad_deg, 4),
+    }
+
+    with open(bbox_path, 'w') as f:
+        json.dump(bbox, f, indent=2)
+
+    logger.info(f"Track bounding box: {bbox}")
+    logger.info(f"Saved to {bbox_path}")
+
+
 def download_atl03(region, start_date, end_date, output_file, granule_id=None, max_granules=None):
     """
     Download ATL03 granules from NASA Earthdata.
@@ -220,6 +267,9 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None, m
         out_h5.attrs['end_date'] = end_date
 
     logger.info(f"Merged {granule_count} granules into {output_file}")
+
+    # Write track bounding box JSON so downstream jobs can use it
+    _write_track_bbox(output_file)
 
     # Summary
     with h5py.File(output_file, 'r') as h5:

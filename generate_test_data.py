@@ -55,26 +55,32 @@ def generate_atl03_h5(output_path):
                 # Simulate three ice types based on position
                 # 0-333m: thick ice, 333-666m: thin ice, 666-1000m: open water
                 h_ph = np.zeros(n_photons_per_beam)
-                signal_conf = np.zeros(n_photons_per_beam, dtype=np.int32)
+                # Real ATL03 signal_conf_ph is (photons, 5) for 5 surface types:
+                # 0=land, 1=ocean, 2=sea_ice, 3=land_ice, 4=inland_water
+                # Sea ice classification uses column 2 (sea_ice surface type)
+                # Pipeline reads column 2; we populate all 5 columns
+                signal_conf = np.zeros((n_photons_per_beam, 5), dtype=np.int8)
 
                 for i in range(n_photons_per_beam):
                     d = dist_along[i]
                     if d < 333:
                         # Thick ice: mean ~0.5m, std ~0.05m
                         h_ph[i] = np.random.normal(0.5, 0.05)
-                        signal_conf[i] = np.random.choice([3, 4], p=[0.3, 0.7])
+                        conf = np.random.choice([3, 4], p=[0.3, 0.7])
                     elif d < 666:
                         # Thin ice: mean ~0.15m, std ~0.03m
                         h_ph[i] = np.random.normal(0.15, 0.03)
-                        signal_conf[i] = np.random.choice([3, 4], p=[0.4, 0.6])
+                        conf = np.random.choice([3, 4], p=[0.4, 0.6])
                     else:
                         # Open water: mean ~0.0m, std ~0.02m
                         h_ph[i] = np.random.normal(0.0, 0.02)
-                        signal_conf[i] = np.random.choice([3, 4], p=[0.3, 0.7])
+                        conf = np.random.choice([3, 4], p=[0.3, 0.7])
+                    signal_conf[i, :] = conf  # Same confidence across all surface types
 
                 # Add some noise photons (low confidence)
                 noise_mask = np.random.random(n_photons_per_beam) < 0.1
-                signal_conf[noise_mask] = np.random.choice([0, 1, 2], size=noise_mask.sum())
+                noise_conf = np.random.choice([0, 1, 2], size=noise_mask.sum())
+                signal_conf[noise_mask, :] = noise_conf[:, np.newaxis]
                 h_ph[noise_mask] += np.random.normal(0, 2.0, size=noise_mask.sum())
 
                 # Lat/lon: simulate Antarctic track

@@ -9,9 +9,21 @@ Calculation from ICESat-2 ATL03 Data"* (Iqrah et al., IPDPSW 2025)
 ## Pipeline Overview
 
 ```
-download_atl03 ──────┐
-                     ├──> preprocess_atl03 ──> auto_label ──> train_model [GPU] ──> classify_seaice [GPU] ──> calculate_freeboard ──> visualize_results
-download_sentinel2 ──┘
+Full mode (single classify job):
+  download_atl03 ──┬──> preprocess_atl03 ──┐
+                   │                        ├──> auto_label ──> train_model [GPU] ──> classify_seaice [GPU] ──> calculate_freeboard ──> visualize_results
+                   └──> download_sentinel2 ─┘
+                        (uses ATL03 track bbox)
+
+Full mode with --max-granules N (parallel classify jobs):
+  download_atl03 ──┬──> preprocess_atl03 ──┐                        ┌─ classify_seaice_0 [GPU] ─┐
+                   │                        ├──> auto_label ──> train ├─ classify_seaice_1 [GPU] ─├─> merge ──> calculate_freeboard ──> visualize
+                   └──> download_sentinel2 ─┘                        └─ classify_seaice_N [GPU] ─┘
+
+Test mode (--test-mode, 2 parallel classify jobs):
+  [test_data/atl03_data.h5] ──> preprocess_atl03 ──┐            ┌─ classify_seaice_0 [GPU] ─┐
+  [test_data/labeled_data.csv] ────────────────────>├──> train ──├─ classify_seaice_1 [GPU] ─├──> merge ──> calculate_freeboard ──> visualize
+                                                                 └───────────────────────────┘
 ```
 
 | Stage | Description | Memory | GPU |
@@ -21,9 +33,71 @@ download_sentinel2 ──┘
 | `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
 | `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
 | `train_model` | Train LSTM or MLP classifier on labeled data | 16 GB | Yes |
-| `classify_seaice` | Run inference on full ATL03 dataset | 8 GB | Yes |
+| `classify_seaice` | Run inference on full ATL03 dataset (parallelized per granule when `--max-granules` is set) | 8 GB | Yes |
+| `merge_classifications` | Concatenate per-granule classification CSVs (only in parallel mode) | 4 GB | No |
 | `calculate_freeboard` | Sliding-window sea surface detection + freeboard | 8 GB | No |
 | `visualize_results` | Generate maps, profiles, summary statistics | 4 GB | No |
+
+## Execution Environments
+
+This workflow requires Pegasus WMS and HTCondor. Two options are available:
+
+### Option A: FABRIC Testbed (Recommended for GPU Workflows)
+
+Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-testbed.net/) using the automated provisioning notebook.
+
+**Prerequisites:**
+- A FABRIC account and active project allocation
+- JupyterHub access via the FABRIC portal
+
+**Setup:**
+
+1. Open the **PegasusAI** artifact on FABRIC:
+   <https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39>
+
+2. Download the `.tgz` archive and upload the notebook to the FABRIC JupyterHub, or clone the artifact directly in a FABRIC Jupyter terminal.
+
+3. Run the notebook cells to:
+   - Create a FABRIC slice with a submit node and one or more worker nodes across FABRIC sites
+   - Configure FABNetv4 networking between all nodes
+   - Install HTCondor (Central Manager on submit node, execute daemons on workers)
+   - Install Pegasus WMS on the submit node
+   - Set up passwordless SSH and hostname resolution (`/etc/hosts`)
+
+4. Once the cluster is running, SSH into the submit node and clone this repository:
+
+   ```bash
+   git clone <repo-url> && cd seaice-workflow
+   ```
+
+5. Follow the [Generate and Submit Workflow](#generate-and-submit-workflow) instructions below.
+
+> **Note:** FABRIC worker nodes can be provisioned with NVIDIA GPUs (e.g., RTX6000, A30, A40) for the `train_model` and `classify_seaice` stages. Request GPU components in the notebook when creating your slice.
+
+### Option B: ACCESS Pegasus (Hosted Environment)
+
+[ACCESS Pegasus](https://pegasus.access-ci.org/) is a hosted workflow environment — no cluster setup required. A built-in **test pool** lets you get started immediately without an allocation.
+
+**Setup:**
+
+1. Log in at <https://pegasus.access-ci.org/> using your ACCESS credentials (single sign-on).
+2. Open a Jupyter notebook or terminal from the Open OnDemand dashboard.
+3. Clone this repository:
+
+   ```bash
+   git clone <repo-url> && cd seaice-workflow
+   ```
+
+4. **To get started quickly**, submit workflows to the built-in test pool — no allocation needed:
+
+   ```bash
+   pegasus-plan --submit -s condorpool -o local workflow.yml
+   ```
+
+5. **To scale up**, request an [ACCESS allocation](https://allocations.access-ci.org/) and use **HTCondor Annex** to provision pilot jobs on allocated resources (see the [ACCESS Pegasus examples](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples)).
+6. Follow the [Generate and Submit Workflow](#generate-and-submit-workflow) instructions below.
+
+> **Note:** The test pool has limited resources and no GPUs. For the GPU-accelerated `train_model` and `classify_seaice` stages, provision GPU nodes via HTCondor Annex with an ACCESS allocation.
 
 ## Quick Start
 
@@ -34,6 +108,8 @@ download_sentinel2 ──┘
 - HTCondor (for condorpool execution)
 - NVIDIA GPU with CUDA drivers on worker nodes (for training/classification)
 - NASA Earthdata account (see below)
+
+Both execution environments above (FABRIC, ACCESS Pegasus) satisfy these prerequisites automatically.
 
 ### NASA Earthdata Credentials
 
@@ -84,12 +160,48 @@ pegasus-plan --submit -s condorpool -o local workflow.yml
 pegasus-status <run-dir>
 ```
 
+### Test Mode (No Downloads)
+
+To test the workflow end-to-end without downloading real data, use `--test-mode`.
+This skips the download and auto-label jobs and uses pre-generated synthetic data:
+
+```bash
+# Generate synthetic test data (one-time setup)
+python generate_test_data.py
+
+# Generate workflow using test data
+python workflow_generator.py --test-mode --output workflow_test.yml
+
+# Submit
+pegasus-plan --submit -s condorpool -o local workflow_test.yml
+```
+
+In test mode, `--start-date` and Earthdata credentials are not required.
+
+### Limited Download Mode
+
+To run with real data but limit download volume for faster testing, use
+`--max-granules` and/or `--max-scenes`:
+
+```bash
+# Download only 2 ATL03 granules and 3 Sentinel-2 scenes
+python workflow_generator.py --region ross_sea \
+                              --start-date 2019-11-01 \
+                              --end-date 2019-11-07 \
+                              --max-granules 2 \
+                              --max-scenes 3 \
+                              --output workflow_limited.yml
+```
+
 ### Command-Line Options
 
 ```
 --region              Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
---start-date          Start date (YYYY-MM-DD)
+--start-date          Start date (YYYY-MM-DD). Required unless --test-mode is used.
 --end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
+--test-mode           Use synthetic test data (skips downloads and auto-label)
+--max-granules        Max ATL03 granules to download (default: all)
+--max-scenes          Max Sentinel-2 scenes to download (default: 10)
 --earthdata-token     Pre-generated bearer token (default: $EARTHDATA_TOKEN)
 --earthdata-username  NASA Earthdata username (default: $EARTHDATA_USERNAME)
 --earthdata-password  NASA Earthdata password (default: $EARTHDATA_PASSWORD)
