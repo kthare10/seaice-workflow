@@ -58,25 +58,42 @@ echo "       --start-date 2019-11-01 \\"
 echo "       -e condorpool \\"
 echo "       --output workflow.yml"
 
+# Example 6: Test mode (no downloads, uses synthetic data)
+echo ""
+echo "6. Test mode (no downloads, uses synthetic test data):"
+echo "   python generate_test_data.py"
+echo "   python workflow_generator.py --test-mode --output workflow_test.yml"
+
+# Example 7: Limited download (fewer granules/scenes for faster testing)
+echo ""
+echo "7. Limited download mode:"
+echo "   python workflow_generator.py \\"
+echo "       --region ross_sea \\"
+echo "       --start-date 2019-11-01 \\"
+echo "       --end-date 2019-11-07 \\"
+echo "       --max-granules 2 \\"
+echo "       --max-scenes 3 \\"
+echo "       --output workflow_limited.yml"
+
 # Run functional test
 echo ""
-echo "7. Run functional test on synthetic data:"
+echo "8. Run functional test on synthetic data:"
 echo "   bash run_test.sh"
 
 # Submit workflow
 echo ""
-echo "8. Submit workflow to Pegasus:"
+echo "9. Submit workflow to Pegasus:"
 echo "   pegasus-plan --submit -s condorpool -o local workflow.yml"
 
 # Monitor workflow
 echo ""
-echo "9. Monitor workflow status:"
+echo "10. Monitor workflow status:"
 echo "   pegasus-status /path/to/submit/directory"
 echo "   pegasus-analyzer /path/to/submit/directory"
 
 # Check outputs
 echo ""
-echo "10. Output files:"
+echo "11. Output files:"
 echo "    atl03_data.h5                  - Downloaded ATL03 photon data"
 echo "    sentinel2_scenes.tar.gz        - Downloaded Sentinel-2 imagery"
 echo "    atl03_preprocessed.csv         - Preprocessed 2m segments"

@@ -38,7 +38,7 @@ REGIONS = {
 }
 
 
-def download_sentinel2(region, start_date, end_date, output_file, max_cloud_cover=30):
+def download_sentinel2(region, start_date, end_date, output_file, max_cloud_cover=30, max_scenes=10):
     """
     Download Sentinel-2 scenes from Planetary Computer.
 
@@ -97,10 +97,10 @@ def download_sentinel2(region, start_date, end_date, output_file, max_cloud_cove
     downloaded = []
     bands = ["B02", "B03", "B04", "B08"]  # Blue, Green, Red, NIR
 
-    for i, item in enumerate(items[:10]):  # Limit to 10 scenes
+    for i, item in enumerate(items[:max_scenes]):
         scene_id = item.id
         cloud_cover = item.properties.get("eo:cloud_cover", -1)
-        logger.info(f"Downloading scene {i+1}/{min(len(items), 10)}: {scene_id} (cloud: {cloud_cover:.1f}%)")
+        logger.info(f"Downloading scene {i+1}/{min(len(items), max_scenes)}: {scene_id} (cloud: {cloud_cover:.1f}%)")
 
         scene_dir = tmp_dir / scene_id
         scene_dir.mkdir(exist_ok=True)
@@ -172,6 +172,8 @@ Examples:
                         help="End date (YYYY-MM-DD), defaults to start_date + 30 days")
     parser.add_argument("--max-cloud-cover", type=float, default=30,
                         help="Maximum cloud cover percentage (default: 30)")
+    parser.add_argument("--max-scenes", type=int, default=10,
+                        help="Maximum number of scenes to download (default: 10)")
     parser.add_argument("--output", type=str, default="sentinel2_scenes.tar.gz",
                         help="Output tar.gz file (default: sentinel2_scenes.tar.gz)")
 
@@ -189,6 +191,7 @@ Examples:
             end_date=args.end_date,
             output_file=args.output,
             max_cloud_cover=args.max_cloud_cover,
+            max_scenes=args.max_scenes,
         )
         logger.info("Sentinel-2 download completed successfully")
     except Exception as e:
