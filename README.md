@@ -37,7 +37,7 @@ Test mode (--test-mode, 2 parallel classify jobs):
 | `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB | No |
 | `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
 | `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
-| `train_model` | Train LSTM or MLP classifier on labeled data | 16 GB | Yes |
+| `train_model` | Train LSTM or MLP classifier on labeled data | 14 GB | Yes |
 | `classify_seaice` | Run inference on full ATL03 dataset (parallelized per granule when `--max-granules` is set) | 8 GB | Yes |
 | `merge_classifications` | Concatenate per-granule classification CSVs (only in parallel mode) | 4 GB | No |
 | `calculate_freeboard` | Sliding-window sea surface detection + freeboard | 8 GB | No |

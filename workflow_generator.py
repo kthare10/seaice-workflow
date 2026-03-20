@@ -176,7 +176,7 @@ class SeaIceWorkflow:
             pfn=os.path.join(self.wf_dir, "bin/train_model.py"),
             is_stageable=True,
             container=seaice_gpu_container,
-        ).add_pegasus_profile(memory="16 GB"
+        ).add_pegasus_profile(memory="14 GB"
         ).add_condor_profile(request_gpus=1)
 
         classify_seaice = Transformation(
