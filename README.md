@@ -99,55 +99,85 @@ Two images keep the footprint down: only the GPU image carries TensorFlow and CU
 | `kthare10/seaice-icesat2-cpu` | download, preprocess, prepare, label, merge, freeboard, visualize | `python:3.10-slim` |
 | `kthare10/seaice-icesat2-gpu` | train, classify | `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` |
 
-**Build SIF images (Apptainer/Singularity).** This is what you want for manual runs, and
-for pre-staging images on a cluster so every job does not re-pull from Docker Hub:
+**Build the images.** Definition files live in `Apptainer/`, converted from the
+Dockerfiles. `Bootstrap: docker` pulls and converts the base image directly, so **no
+Docker installation is required** to build a `.sif`:
 
 ```bash
-mkdir -p Apptainer
-
-# Straight from Docker Hub - no Docker daemon needed
-apptainer build Apptainer/seaice-cpu.sif docker://kthare10/seaice-icesat2-cpu:latest
-apptainer build Apptainer/seaice-gpu.sif docker://kthare10/seaice-icesat2-gpu:latest
+apptainer build Apptainer/SeaIce_CPU_Container.sif Apptainer/SeaIce_CPU_Container.def
+apptainer build Apptainer/SeaIce_GPU_Container.sif Apptainer/SeaIce_GPU_Container.def
 ```
 
-A SIF is uncompressed, so budget more disk than the Docker Hub figures suggest: about
-**1.5 GB** for the CPU image (600 MB compressed) and **9 GB** for the GPU one (3.9 GB
-compressed). Each takes a few minutes. `singularity` works identically if that is what
-your site provides.
+Build on an **x86_64 Linux host**; the images are not multi-arch. `singularity` works
+identically if that is what your site provides. The CPU image comes out around
+**380 MB** and the GPU image around **5.4 GB** (SIF is squashfs-compressed,
+so both are smaller than the Docker Hub layer totals). Budget several GB of scratch in
+`$APPTAINER_TMPDIR` during the build, and a few minutes for the CPU image — the GPU one
+takes considerably longer, most of it compressing the CUDA wheels.
 
-> **The images carry only the Python environment, not the code.** `bin/*.py` is bind-mounted
-> for manual runs and staged in by Pegasus (`is_stageable=True`), so editing a stage script
-> never requires rebuilding an image. You only need to rebuild when dependencies change.
-
-**Build from the Dockerfiles instead** (when you have changed dependencies):
+Both definitions end with a `%test` section that imports every module the stages use, so
+a broken image fails at build time rather than inside a job. Re-run it any time:
 
 ```bash
-docker build -t seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
-docker build -t seaice-icesat2-gpu:latest -f Docker/Seaice_Dockerfile .
-
-# Convert the locally built images to SIF
-apptainer build Apptainer/seaice-cpu.sif docker-daemon://seaice-icesat2-cpu:latest
-apptainer build Apptainer/seaice-gpu.sif docker-daemon://seaice-icesat2-gpu:latest
+apptainer test Apptainer/SeaIce_CPU_Container.sif
+apptainer test Apptainer/SeaIce_GPU_Container.sif
 ```
 
-**Verify an image:**
+To confirm the GPU image actually sees a device (the build-time test cannot, since
+builders rarely have one):
 
 ```bash
-apptainer exec Apptainer/seaice-cpu.sif \
-    python3 -c "import pandas, rasterio, pyproj, scipy; print('cpu ok')"
-apptainer exec --nv Apptainer/seaice-gpu.sif \
+apptainer exec --nv Apptainer/SeaIce_GPU_Container.sif \
     python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
-If the GPU check prints an empty list the container cannot see a device — check the host
-driver and that you passed `--nv`. TensorFlow falls back to CPU, just slowly.
+An empty list means the container cannot reach a device — check the host driver and that
+you passed `--nv`. TensorFlow falls back to CPU, just slowly.
 
-**Using local SIFs with Pegasus.** The workflow points at Docker Hub by default. To use
-images you built, edit the two `Container(...)` definitions in `workflow_generator.py`
-(`create_transformation_catalog`):
+> **The images carry only the Python environment, not the code.** `bin/*.py` is
+> bind-mounted for manual runs and staged in by Pegasus (`is_stageable=True`), so editing
+> a stage script never requires rebuilding an image. Rebuild only when dependencies
+> change.
 
-```python
-image="file:///absolute/path/to/Apptainer/seaice-cpu.sif",
+**Point the workflow at your images** with `--sif-dir`. Without it, Pegasus pulls from
+Docker Hub at runtime — which costs a pull on every worker:
+
+```bash
+python workflow_generator.py --labeled-csv-dir data/IS2_Corrected_data \
+                              --sif-dir "$PWD/Apptainer" \
+                              --output workflow_labeled.yml
+```
+
+The directory must contain both `SeaIce_CPU_Container.sif` and
+`SeaIce_GPU_Container.sif`; the generator checks and tells you the build commands if
+either is missing. On a multi-node cluster the path must be readable from the workers.
+
+> **If a job dies with `image format not recognized`, this is the fix.** Pegasus stages
+> the Docker Hub image to the worker as `seaice_container.simg`, and some Apptainer
+> versions refuse to open it:
+>
+> ```
+> FATAL: While checking container encryption: could not open image
+>        .../seaice_container.simg: image format not recognized
+> PegasusLite: exitcode 71, tool originally exited with exitcode 255
+> ```
+>
+> Building the SIF yourself and passing `--sif-dir` skips the pull-and-convert step
+> entirely, which avoids the problem.
+
+
+**Alternatives.** Pull the prebuilt images from Docker Hub instead of building:
+
+```bash
+apptainer build Apptainer/SeaIce_CPU_Container.sif docker://kthare10/seaice-icesat2-cpu:latest
+apptainer build Apptainer/SeaIce_GPU_Container.sif docker://kthare10/seaice-icesat2-gpu:latest
+```
+
+Or build OCI images from the Dockerfiles and convert them:
+
+```bash
+docker build -t seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
+apptainer build Apptainer/SeaIce_CPU_Container.sif docker-daemon://seaice-icesat2-cpu:latest
 ```
 
 ### Python environment (manual runs without containers)
@@ -308,11 +338,11 @@ environment through, so `EARTHDATA_TOKEN` is visible inside:
 
 ```bash
 # CPU stages
-apptainer exec --bind "$PWD:/work" --pwd /work Apptainer/seaice-cpu.sif \
+apptainer exec --bind "$PWD:/work" --pwd /work Apptainer/SeaIce_CPU_Container.sif \
     python3 bin/preprocess_atl03.py --input atl03_data.h5 --output atl03_preprocessed.csv
 
 # GPU stages need --nv
-apptainer exec --nv --bind "$PWD:/work" --pwd /work Apptainer/seaice-gpu.sif \
+apptainer exec --nv --bind "$PWD:/work" --pwd /work Apptainer/SeaIce_GPU_Container.sif \
     python3 bin/train_model.py --input labeled_data.csv \
         --model-output model.h5 --metrics-output training_metrics.json
 ```
@@ -516,6 +546,8 @@ python workflow_generator.py --region ross_sea \
                       preprocess, and auto-label; no credentials needed)
 --local-atl03-dir     Directory of already-downloaded ATL03 .h5 granules
                       (skips the ATL03 download; no Earthdata credentials needed)
+--sif-dir             Directory with locally built SeaIce_*_Container.sif images
+                      (default: pull the images from Docker Hub at runtime)
 --max-granules        Max ATL03 granules to download (default: all)
 --max-scenes          Max Sentinel-2 scenes to download (default: 10)
 --earthdata-token     Pre-generated bearer token (default: $EARTHDATA_TOKEN)

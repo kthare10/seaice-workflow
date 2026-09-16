@@ -1,0 +1,84 @@
+# Sea ice workflow container - CPU stages.
+#
+# Used by: download_atl03, download_sentinel2, prepare_labeled_csv,
+#          preprocess_atl03, auto_label, merge_classifications,
+#          calculate_freeboard, visualize_results
+#
+# Converted from Docker/Seaice_CPU_Dockerfile. `Bootstrap: docker` pulls and
+# converts the OCI base image directly, so no Docker installation is needed to
+# build the .sif.
+#
+# The workflow's bin/*.py scripts are NOT baked in — Pegasus stages them
+# (is_stageable=True) and manual runs bind-mount them. Rebuild this image only
+# when dependencies change, never when a stage script changes.
+#
+# Build (on an x86_64 Linux host — see README):
+#   apptainer build Apptainer/SeaIce_CPU_Container.sif Apptainer/SeaIce_CPU_Container.def
+
+Bootstrap: docker
+From: python:3.10-slim-bookworm
+
+%post
+    # Install system dependencies.
+    # curl + wget are mandatory: PegasusLite downloads its worker package
+    # inside the container before the job script ever runs.
+    # The -dev packages provide the headers h5py, rasterio and pyproj build
+    # against; they are deliberately left in place rather than purged, because
+    # removing them has previously taken the runtime libraries with them.
+    apt-get update && \
+        apt-get install -y --no-install-recommends \
+            build-essential \
+            libhdf5-dev \
+            libgeos-dev \
+            libproj-dev \
+            git \
+            wget \
+            curl \
+            openssh-client \
+            ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    # Install Python dependencies
+    pip install --no-cache-dir \
+        numpy \
+        pandas \
+        scipy \
+        scikit-learn \
+        h5py \
+        matplotlib \
+        rasterio \
+        pyproj \
+        earthaccess \
+        planetary-computer \
+        pystac-client \
+        requests
+
+    # Docker's WORKDIR /app has no Apptainer equivalent; create the directory
+    # here and let Pegasus jobs cd into their own working directory at runtime.
+    mkdir -p /app
+
+%environment
+    # Set Python to not buffer output (important for Pegasus log capture)
+    export PYTHONUNBUFFERED=1
+    # Headless plotting for visualize_results.py
+    export MPLBACKEND=Agg
+    # The image is read-only, so matplotlib cannot use its default /root/.config
+    # cache; without this every job logs a warning and rebuilds the font cache.
+    export MPLCONFIGDIR=/tmp/matplotlib
+
+%runscript
+    exec /bin/bash "$@"
+
+%test
+    # Every third-party import used by the CPU stages
+    python3 -c "
+import numpy, pandas, scipy, sklearn, h5py, matplotlib, rasterio, pyproj
+import earthaccess, planetary_computer, pystac_client, requests
+from scipy.interpolate import RegularGridInterpolator
+from rasterio.warp import reproject, calculate_default_transform
+print('CPU container OK - pandas', pandas.__version__, '| rasterio', rasterio.__version__)
+"
+
+%labels
+    maintainer Komal Thareja <kthare10@renci.org>
+    description Sea ice classification and freeboard workflow - CPU stages (ICESat-2 ATL03 + Sentinel-2)

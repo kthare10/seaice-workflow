@@ -5,8 +5,8 @@
 test_data/
 test_output/
 
-# Container images (build with: apptainer build Apptainer/seaice-cpu.sif docker://...)
-Apptainer/
+# Built container images (the .def files ARE tracked)
+Apptainer/*.sif
 *.sif
 
 # Python

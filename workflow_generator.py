@@ -53,6 +53,11 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
+# Built by Apptainer/*.def; see the README "Containers" section
+CPU_SIF_NAME = "SeaIce_CPU_Container.sif"
+GPU_SIF_NAME = "SeaIce_GPU_Container.sif"
+
+
 def granule_key_from_csv(path):
     """Derive a granule key from a pre-labeled CSV file name.
 
@@ -132,25 +137,37 @@ class SeaIceWorkflow:
 
         self.sc.add_sites(local, exec_site)
 
-    def create_transformation_catalog(self, exec_site_name="condorpool"):
+    def create_transformation_catalog(self, exec_site_name="condorpool", sif_dir=None):
         """Create transformation catalog with executables and containers."""
         logger.info("Creating transformation catalog")
         self.tc = TransformationCatalog()
+
+        # Container images: pulled from Docker Hub by default, or taken from
+        # locally built SIFs when --sif-dir is given (see Apptainer/*.def).
+        if sif_dir:
+            cpu_image = "file://" + os.path.join(sif_dir, CPU_SIF_NAME)
+            gpu_image = "file://" + os.path.join(sif_dir, GPU_SIF_NAME)
+            image_site = "local"
+            logger.info(f"Using local SIF images from {sif_dir}")
+        else:
+            cpu_image = "docker://kthare10/seaice-icesat2-cpu:latest"
+            gpu_image = "docker://kthare10/seaice-icesat2-gpu:latest"
+            image_site = "docker_hub"
 
         # CPU container for non-GPU stages (lightweight, no TensorFlow)
         seaice_container = Container(
             "seaice_container",
             container_type=Container.SINGULARITY,
-            image="docker://kthare10/seaice-icesat2-cpu:latest",
-            image_site="docker_hub",
+            image=cpu_image,
+            image_site=image_site,
         )
 
         # GPU container for training and classification (--nv enables NVIDIA GPU passthrough)
         seaice_gpu_container = Container(
             "seaice_gpu_container",
             container_type=Container.SINGULARITY,
-            image="docker://kthare10/seaice-icesat2-gpu:latest",
-            image_site="docker_hub",
+            image=gpu_image,
+            image_site=image_site,
         ).add_env(SINGULARITY_ARGS="--nv")
 
         # Transformations
@@ -675,6 +692,14 @@ Available regions:
              "still run as usual."
     )
     parser.add_argument(
+        "--sif-dir",
+        type=str,
+        default=None,
+        help="Directory holding locally built Apptainer images "
+             f"({CPU_SIF_NAME}, {GPU_SIF_NAME}), built from Apptainer/*.def. "
+             "Without this the workflow pulls the images from Docker Hub at runtime."
+    )
+    parser.add_argument(
         "--labeled-csv-dir",
         type=str,
         default=None,
@@ -716,6 +741,21 @@ Available regions:
     )
 
     args = parser.parse_args()
+
+    # Resolve locally built container images, if any
+    sif_dir = None
+    if args.sif_dir:
+        sif_dir = os.path.abspath(os.path.expanduser(args.sif_dir))
+        if not os.path.isdir(sif_dir):
+            parser.error(f"--sif-dir is not a directory: {sif_dir}")
+        missing = [n for n in (CPU_SIF_NAME, GPU_SIF_NAME)
+                   if not os.path.exists(os.path.join(sif_dir, n))]
+        if missing:
+            parser.error(
+                f"--sif-dir {sif_dir} is missing {', '.join(missing)}. Build them with:\n"
+                f"  apptainer build {sif_dir}/{CPU_SIF_NAME} Apptainer/SeaIce_CPU_Container.def\n"
+                f"  apptainer build {sif_dir}/{GPU_SIF_NAME} Apptainer/SeaIce_GPU_Container.def"
+            )
 
     # Resolve pre-labeled segment CSVs, if any
     labeled_csv_files = None
@@ -824,6 +864,7 @@ Available regions:
             logger.info(f"Max ATL03 granules: {args.max_granules}")
         if args.max_scenes:
             logger.info(f"Max Sentinel-2 scenes: {args.max_scenes}")
+    logger.info(f"Containers: {sif_dir if sif_dir else 'Docker Hub'}")
     logger.info(f"Execution site: {args.execution_site_name}")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
@@ -839,7 +880,7 @@ Available regions:
         workflow.create_pegasus_properties()
 
         logger.info("Creating transformation catalog...")
-        workflow.create_transformation_catalog(args.execution_site_name)
+        workflow.create_transformation_catalog(args.execution_site_name, sif_dir=sif_dir)
 
         logger.info("Creating replica catalog...")
         workflow.create_replica_catalog(

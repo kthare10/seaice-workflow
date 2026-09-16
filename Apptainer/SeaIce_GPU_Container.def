@@ -1,0 +1,96 @@
+# Sea ice workflow container - GPU stages.
+#
+# Used by: train_model, classify_seaice
+#
+# Converted from Docker/Seaice_Dockerfile. `Bootstrap: docker` pulls and
+# converts the OCI base image directly, so no Docker installation is needed to
+# build the .sif.
+#
+# Two lessons from this image's history are deliberately preserved:
+#   * single stage only — a multi-stage build put the pip prefix in the wrong
+#     place and broke imports;
+#   * no `apt-get autoremove` — it takes pip-installed dependencies with it.
+#
+# The base is Ubuntu 22.04, whose system python3 is already 3.10, so no
+# deadsnakes PPA is needed here (the Dockerfile adds one; the result is the
+# same interpreter version without the extra network dependency).
+#
+# The workflow's bin/*.py scripts are NOT baked in — Pegasus stages them
+# (is_stageable=True) and manual runs bind-mount them. Rebuild this image only
+# when dependencies change, never when a stage script changes.
+#
+# Build (on an x86_64 Linux host with ~20 GB free for the build — see README):
+#   apptainer build Apptainer/SeaIce_GPU_Container.sif Apptainer/SeaIce_GPU_Container.def
+#
+# Run GPU stages with --nv so the host NVIDIA driver is passed through:
+#   apptainer exec --nv Apptainer/SeaIce_GPU_Container.sif python3 bin/train_model.py ...
+
+Bootstrap: docker
+From: nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Install system dependencies.
+    # curl + wget are mandatory: PegasusLite downloads its worker package
+    # inside the container before the job script ever runs.
+    apt-get update && \
+        apt-get install -y --no-install-recommends \
+            python3 \
+            python3-dev \
+            python3-pip \
+            build-essential \
+            libhdf5-dev \
+            git \
+            wget \
+            curl \
+            openssh-client \
+            ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    # `python` as well as `python3`, matching the Docker image
+    update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+    python3 -m pip install --no-cache-dir --upgrade pip
+
+    # tensorflow[and-cuda] pulls the CUDA/cuDNN Python wheels that give XLA a
+    # working libdevice; plain `tensorflow` is not sufficient on this base.
+    python3 -m pip install --no-cache-dir \
+        numpy \
+        pandas \
+        scikit-learn \
+        h5py \
+        "tensorflow[and-cuda]"
+
+    # Docker's WORKDIR /app has no Apptainer equivalent; create the directory
+    # here and let Pegasus jobs cd into their own working directory at runtime.
+    mkdir -p /app
+
+%environment
+    # Set Python to not buffer output (important for Pegasus log capture)
+    export PYTHONUNBUFFERED=1
+    # NVIDIA passthrough (apptainer --nv also sets these up on the host side)
+    export NVIDIA_VISIBLE_DEVICES=all
+    export NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    # Quieten TensorFlow's startup banner in Pegasus logs
+    export TF_CPP_MIN_LOG_LEVEL=2
+
+%runscript
+    exec /bin/bash "$@"
+
+%test
+    # Import check only. This runs at build time, where a GPU is usually not
+    # visible, so device discovery is reported rather than asserted — verify it
+    # on a GPU host with:
+    #   apptainer exec --nv <sif> python3 -c \
+    #     "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+    python3 -c "
+import numpy, pandas, sklearn, h5py
+import tensorflow as tf
+print('GPU container OK - tensorflow', tf.__version__)
+print('devices visible at build time:', tf.config.list_physical_devices('GPU'))
+"
+
+%labels
+    maintainer Komal Thareja <kthare10@renci.org>
+    description Sea ice classification and freeboard workflow - GPU stages (LSTM/MLP train + inference)
