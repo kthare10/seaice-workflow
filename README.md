@@ -9,6 +9,14 @@ and freeboard calculation from ICESat-2 ATL03 photon-level data.
 Based on: *"Scalable Higher Resolution Polar Sea Ice Classification and Freeboard
 Calculation from ICESat-2 ATL03 Data"* (Iqrah et al., IPDPSW 2025)
 
+**Fidelity to the paper:** [`PAPER_COMPARISON.md`](PAPER_COMPARISON.md) audits every
+stage against the paper, marks each item as implemented / interpreted / out of scope,
+and records the reproduction numbers. On the authors' own labeled data the LSTM reaches
+**94.96 %** held-out accuracy (paper: 96.56 %); the gap sits in the two minority classes.
+Where the paper is silent — focal-loss parameters, the exact feature definitions, sigma
+in Eq. 2, the thin-cloud filter — this implementation's choice is documented there
+rather than presented as the paper's.
+
 ## Pipeline Overview
 
 ![Sea Ice Workflow DAG](images/workflow.png)
@@ -44,15 +52,15 @@ Test mode (--test-mode, 2 parallel classify jobs):
 | Stage | Description | Memory | GPU |
 |-------|-------------|--------|-----|
 | `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata (or merge local granules with `--local-atl03-dir`) | 4 GB | No |
-| `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB | No |
+| `download_sentinel2` | Fetch Sentinel-2 TCI + SCL within ±80 min of each ATL03 pass | 4 GB | No |
 | `prepare_labeled_csv` | Harmonize pre-labeled segment CSVs into the workflow schema (only in `--labeled-csv-dir` mode; replaces the three stages above) | 8 GB | No |
-| `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
-| `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
+| `preprocess_atl03` | Strong beams, high-confidence photons, 2 m segments, MSS/tide/FPB correction, ATL03 background | 8 GB | No |
+| `auto_label` | HSV-threshold S2 labels (cloud-masked), EPSG:3976 overlay onto ATL03 segments | 4 GB | No |
 | `train_model` | Train LSTM or MLP classifier on labeled data | 14 GB | Yes |
 | `classify_seaice` | Run inference on full ATL03 dataset (parallelized per granule when `--max-granules` is set) | 8 GB | Yes |
 | `merge_classifications` | Concatenate per-granule classification CSVs (only in parallel mode) | 4 GB | No |
-| `calculate_freeboard` | Sliding-window sea surface detection + freeboard | 8 GB | No |
-| `visualize_results` | Generate maps, profiles, summary statistics | 4 GB | No |
+| `calculate_freeboard` | 10 km / 5 km-step windows, NASA Eq. 2–3 sea surface, freeboard | 8 GB | No |
+| `visualize_results` | Maps, along-track profiles, held-out confusion matrix, summary statistics | 4 GB | No |
 
 ## Execution Environments
 
@@ -120,7 +128,9 @@ Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-te
 - [Pegasus WMS](https://pegasus.isi.edu/) 5.0+
 - HTCondor (for condorpool execution)
 - NVIDIA GPU with CUDA drivers on worker nodes (for training/classification)
-- NASA Earthdata account (see below)
+- NASA Earthdata account (see below) — **not** required for
+  [Labeled CSV Mode](#labeled-csv-mode-pre-labeled-segment-data),
+  [Local Data Mode](#local-data-mode-already-downloaded-granules), or `--test-mode`
 
 Both execution environments above (FABRIC, ACCESS Pegasus) satisfy these prerequisites automatically.
 
@@ -193,6 +203,17 @@ pegasus-plan --submit -s condorpool -o local workflow_test.yml
 
 In test mode, `--start-date` and Earthdata credentials are not required.
 
+`generate_test_data.py` builds two synthetic **raw** ATL03 granules carrying the full
+structure the pipeline reads — photon IDs, 20 m geolocation segments, `geophys_corr`
+with an MSS flag, `bckgrd_atlas`, CAL-19 / CAL-42 tables, `atlas_beam_type`,
+`sc_orient` — with a planted 200 m pattern of thick ice (0.30 m freeboard), thin ice
+(0.05 m) and open water (0.00 m). It then pushes them through the real
+`download_atl03.py` merge and `preprocess_atl03.py`, so the test fixtures always match
+the pipeline's current schema, and labels come from the planted pattern.
+
+`./run_test.sh` runs the whole chain (generate → preprocess → train → classify →
+freeboard → visualize) locally without Pegasus and checks each output.
+
 ### Labeled CSV Mode (Pre-Labeled Segment Data)
 
 If you already have **labeled, segmented** ATL03 data as CSV — for example the
@@ -217,31 +238,30 @@ input file) → merge → calculate_freeboard → visualize_results`.
 |---|---|
 | `lat`, `lon` | `lat`, `lon` |
 | `along_track_dist` | `x_atc` |
-| `mean_h` | `h_cor_mean` (falls back to `height_mean`) |
-| `median_h` | `h_cor_med` (falls back to `height_med`) |
+| `mean_h`, `median_h` | `h_cor_mean`, `h_cor_med` (= height − mss − tide − fpb_corr) |
 | `std_h` | `height_sd` |
 | `photon_count` | `N` |
-| `bg_rate` | `brate_mean` |
+| `pcnt`, `pcnth` | `pcnt_mean`, `pcnth_mean` (photons / high-confidence photons per shot) |
+| `bcnt`, `brate` | `bcnt_mean`, `brate_mean` (ATL03 background counts / rate) |
+| `d_pcnt`, `d_brate` | along-track first differences, computed here |
+| `mss`, `tide_ocean`, `fpb_corr` | carried through for traceability |
 | `beam`, `granule` | parsed from the file name |
 | `label` | `label` (0 = thick ice, 1 = thin ice, 2 = open water) |
 
 The **corrected** heights (`h_cor_*`) are used rather than the raw ellipsoidal
-heights, because `calculate_freeboard` expects sea-surface-referenced
-elevations. If only raw heights are present the job warns and falls back to
-them, but freeboard values will be meaningless.
+heights; the job warns and falls back to raw heights if only those exist, in
+which case freeboard values are meaningless. The same 22-column schema is
+produced by `preprocess_atl03.py`, so a model trained in one mode can be
+applied in the other.
 
 Notes:
 
 - Each input file becomes its own `granule` (the file name minus the
   `_labeled...` suffix), so the classify stage fans out one job per file and
-  `calculate_freeboard` computes its sliding-window sea surface per track.
-- The `label` column is carried through inference as ground truth, so
-  `visualize_results` emits a confusion matrix and per-class accuracy
-  (Fig. 4 in the paper) alongside the usual maps and profiles.
-- Training and inference run over the same corpus. `train_model` holds out a
-  stratified 20% split internally and reports `test_accuracy` in
-  `training_metrics.json` — use that as the honest accuracy number; the
-  confusion matrix covers all segments, including those seen in training.
+  `calculate_freeboard` computes its sea surface per track.
+- The `label` column is carried through inference, so `summary_statistics.json`
+  also reports agreement over all segments; the held-out 20 % metrics from
+  `training_metrics.json` are the ones comparable to the paper's Table III.
 - Cannot be combined with `--test-mode` or `--local-atl03-dir`.
 - `--start-date` and Earthdata credentials are not required.
 
@@ -327,6 +347,21 @@ python workflow_generator.py --region ross_sea \
 -o                    Output workflow file (default: workflow.yml)
 ```
 
+Several paper parameters are exposed on the stage scripts rather than the generator,
+for standalone runs:
+
+```
+download_sentinel2.py --max-time-diff-min   IS2/S2 coincidence window (default: 80, paper Sec. III.A.3)
+                      --max-cloud-cover     Scene cloud cover cap (default: 30)
+train_model.py        --epochs              Default 20   (paper Sec. IV.A)
+                      --batch-size          Default 32   (paper Sec. IV.A)
+                      --model-type          lstm | mlp
+calculate_freeboard.py --window-radius      Default 5000 m (10 km window)
+                       --window-step        Default 5000 m (paper: "sliding overlap of 5 km")
+visualize_results.py  --metrics-input       training_metrics.json, supplies the held-out
+                                            confusion matrix and precision/recall/F1
+```
+
 ## GPU Acceleration
 
 The `train_model` and `classify_seaice` stages are GPU-accelerated using
@@ -345,34 +380,69 @@ Non-GPU stages use the lightweight `kthare10/seaice-icesat2-cpu:latest` image.
 
 ## Scientific Details
 
-### ATL03 Preprocessing
+Each stage follows Iqrah et al. (IPDPSW 2025); `PAPER_COMPARISON.md` records
+the paper-vs-code audit and the places where the paper is silent and this
+implementation had to choose.
 
-- Reads photon heights (`h_ph`), positions (`lat_ph`, `lon_ph`), and signal confidence (`signal_conf_ph`)
-- Filters for high-confidence signal photons (confidence >= 3 on sea ice surface)
-- Resamples to 2m along-track bins
-- Per bin: mean/median/std height, photon count, background rate
-- Applies first-photon bias correction
+### ATL03 Preprocessing (`preprocess_atl03.py`)
 
-### Auto-Labeling
+- **Strong beams only**, chosen per granule from each beam group's
+  `atlas_beam_type` attribute (fallback: `orbit_info/sc_orient`). Which of
+  `gtNl`/`gtNr` is strong depends on spacecraft orientation.
+- **High-confidence sea-ice photons**: `signal_conf_ph[:, 2] == 4`, nominal
+  `quality_ph` only (afterpulse / impulse-response / TEP photons removed).
+- **Absolute along-track distance** = `geolocation/segment_dist_x` +
+  `heights/dist_ph_along` (the latter is relative to its 20 m segment).
+- **2 m along-track bins** with mean / median / std height, photon count,
+  laser-shot count, photon rates per shot (`pcnt`, high-confidence `pcnth`),
+  and ATL03 `bckgrd_atlas` background counts / rate (`bcnt`, `brate`).
+- **Geophysical correction** `h_cor = h − MSS − ocean tide − FPB`, the formula
+  that reproduces `h_cor_mean` in the authors' labeled data to 4 µm. MSS is
+  ATL03 `geophys_corr/dem_h` where `dem_flag == 3`; tide is
+  `geophys_corr/tide_ocean`; FPB follows the ATL07 ATBD (App. G): apparent
+  width (10 %–90 % cumulative interval) and strength (photons/shot) index the
+  granule's CAL-19 tables at the beam's average CAL-42 dead time.
+- Rate-of-change features `d_pcnt`, `d_brate` are first differences along
+  track within a beam.
 
-- Reprojects to EPSG:3976 (Antarctic Polar Stereographic)
-- Classifies S2 imagery using band ratios: thick ice (high reflectance), thin ice (moderate, blue/red > 1), open water (low NIR)
-- Overlays S2-derived labels onto nearest ATL03 2m segments
+### Auto-Labeling (`download_sentinel2.py`, `auto_label.py`)
 
-### Model Architecture
+- Sentinel-2 L2A scenes are selected **per ATL03 granule within ±80 min of
+  the overpass** (paper Sec. III.A.3 / Table I), ranked by time difference.
+- Pixels are labeled by the **published HSV ranges** (Iqrah et al. 2023,
+  Sec. 3.2) on the 8-bit true-color image: V ≥ 205 thick ice, 31–204 thin
+  ice, ≤ 30 open water.
+- Cloud and cloud-shadow pixels are masked with the L2A **Scene
+  Classification Layer** (classes 0, 1, 3, 8, 9, 10). The paper's OpenCV
+  thin-cloud/shadow filter is not specified; this is an explicit substitute.
+- Label raster and ATL03 segments are both placed in **EPSG:3976**; the
+  paper's **Table I image shifts** are applied for matching ICESat-2 dates.
+- Labels transfer only from a scene to the granule it was matched to. There
+  is no height-based fallback; with no labels the job fails loudly.
 
-**LSTM**: 1 LSTM layer (16 units, ELU) + 7 Dense layers -> softmax(3)
-**MLP**: Dense(32, ReLU) -> Dense(3, softmax)
+### Features and Model Architecture (`train_model.py`)
 
-Both use focal loss for class imbalance and Adam optimizer (lr=0.003).
+Six features per 2 m segment (paper Sec. III.B.1): `mean_h`, `std_h`,
+`pcnth`, `d_pcnt`, `bcnt`, `d_brate`.
 
-### Freeboard Calculation
+- **LSTM**: input is a **5-segment window centered on the segment** (n−2 … n+2),
+  built per track in along-track order *before* the 80/20 split.
+  LSTM(16, ELU, dropout 0.2) → Dense 32, 96, 32, 16, 112, 48, 64 (ELU) →
+  softmax(3).
+- **MLP**: Dense(32, ReLU) → Dropout(0.2) → softmax(3).
+- Adam (lr 0.003), focal loss, **batch size 32**, 20 epochs.
+- `training_metrics.json` reports accuracy, precision, recall, F1 and the
+  confusion matrix on the held-out 20 % (paper Table III / Fig. 4).
 
-- 10km sliding window (5km radius)
-- Identifies open water segments within window
-- Computes local sea surface height using distance-weighted mean
-- Linear interpolation where no open water exists
-- Freeboard = segment_elevation - local_sea_surface
+### Freeboard Calculation (`calculate_freeboard.py`)
+
+- 10 km windows (5 km radius) **stepped 5 km** along each track.
+- Open-water segments form leads; each lead's height uses the paper's
+  **Eq. 2** (weights `exp(−((h_i − h_min)/σ_i)²)`, σ_i² = std_h²/N floored at
+  1 cm²); a window's reference height combines leads by inverse variance
+  (**Eq. 3**). Windows without leads are linearly interpolated.
+- Freeboard = corrected segment height − reference sea surface (Eq. 1).
+  Tracks with no open water get no freeboard rather than an invented surface.
 
 ## Container Images
 
@@ -398,20 +468,43 @@ use `--nv` for NVIDIA device passthrough.
 
 | File | Description |
 |------|-------------|
-| `atl03_data.h5` | Raw ATL03 photon data (HDF5) |
-| `sentinel2_scenes.tar.gz` | Sentinel-2 band imagery |
-| `atl03_preprocessed.csv` | 2m segment features |
-| `labeled_data.csv` | Auto-labeled training data |
-| `model.h5` | Trained classifier weights |
-| `training_metrics.json` | Training loss/accuracy history |
-| `classification_results.csv` | Per-segment ice type predictions |
-| `freeboard_results.csv` | Per-segment freeboard values |
-| `classification_map.png` | Geographic classification map |
+| `atl03_data.h5` | Merged strong-beam ATL03: photons, 20 m geolocation, `geophys_corr`, `bckgrd_atlas`, CAL-19/CAL-42 tables |
+| `atl03_bbox.json` | Per-granule track bbox, strong beams, and UTC overpass window (drives the S2 search) |
+| `sentinel2_scenes.tar.gz` | Per-scene true-color (TCI) + Scene Classification Layer (SCL) + `meta.json` pairing |
+| `atl03_preprocessed.csv` | 2 m segments: corrected heights, photon rates, ATL03 background, along-track deltas (22 columns) |
+| `labeled_data.csv` | Preprocessed segments plus the Sentinel-2 `label` and the scene it came from |
+| `model.h5` + `model.scaler.npz` | Trained classifier and its feature scaler |
+| `training_metrics.json` | Config, epoch history, and held-out 20 % accuracy / precision / recall / F1 / confusion matrix |
+| `classification_results.csv` | Per-segment ice type predictions and confidence |
+| `freeboard_results.csv` | Per-segment freeboard, reference sea surface, its sigma, and leads-in-window count |
+| `classification_map.png` | Elevation profile, geographic map, held-out confusion matrix |
 | `freeboard_profile.png` | Along-track freeboard profile |
-| `summary_statistics.json` | Aggregate statistics |
+| `summary_statistics.json` | Aggregate statistics, held-out evaluation, freeboard distributions |
 
 ## References
 
-- Iqrah et al., "Scalable Higher Resolution Polar Sea Ice Classification and Freeboard Calculation from ICESat-2 ATL03 Data", IPDPSW 2025
+Primary:
+
+- Iqrah, Koo, Wang, Xie, Prasad, "Scalable Higher Resolution Polar Sea Ice Classification
+  and Freeboard Calculation from ICESat-2 ATL03 Data", IPDPSW 2025 —
+  [arXiv:2502.02700](https://arxiv.org/abs/2502.02700)
+
+Sources this implementation depends on for details the primary paper leaves out:
+
+- Iqrah et al., "Toward Polar Sea-Ice Classification using Color-based Segmentation and
+  Auto-labeling of Sentinel-2 Imagery", 2023 —
+  [arXiv:2303.12719](https://arxiv.org/abs/2303.12719). Sec. 3.2 gives the HSV ranges
+  used by `auto_label.py`.
+- Iqrah et al., "A Parallel Workflow for Polar Sea-Ice Classification using Auto-labeling
+  of Sentinel-2 Imagery", PDSEC 2024 — [arXiv:2403.13135](https://arxiv.org/abs/2403.13135)
+- ICESat-2 ATL07/ATL10 ATBD r006 — first-photon-bias procedure (Appendix G) implemented in
+  `preprocess_atl03.py`:
+  [icesat2_atl07_atl10_atl20_atl21_atbd_v006.pdf](https://nsidc.org/sites/default/files/documents/technical-reference/icesat2_atl07_atl10_atl20_atl21_atbd_v006.pdf)
+- ICESat-2 ATL03 v006 data dictionary — field definitions for `segment_dist_x`,
+  `geophys_corr`, `bckgrd_atlas`, CAL-19/CAL-42:
+  [icesat2_atl03_data_dict_v006.pdf](https://nsidc.org/sites/default/files/documents/technical-reference/icesat2_atl03_data_dict_v006.pdf)
+
+Data:
+
 - ICESat-2 ATL03: https://nsidc.org/data/atl03
-- Sentinel-2 via Planetary Computer: https://planetarycomputer.microsoft.com
+- Sentinel-2 L2A via Planetary Computer: https://planetarycomputer.microsoft.com

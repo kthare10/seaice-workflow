@@ -572,8 +572,9 @@ class SeaIceWorkflow:
                 "--classification-map-output", classification_map,
                 "--freeboard-profile-output", freeboard_profile,
                 "--summary-output", summary_stats,
+                "--metrics-input", training_metrics,
             )
-            .add_inputs(classification_results, freeboard_results)
+            .add_inputs(classification_results, freeboard_results, training_metrics)
             .add_outputs(classification_map, stage_out=True, register_replica=False)
             .add_outputs(freeboard_profile, stage_out=True, register_replica=False)
             .add_outputs(summary_stats, stage_out=True, register_replica=False)

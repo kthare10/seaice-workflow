@@ -171,7 +171,8 @@ ${PYTHON} "${BIN_DIR}/visualize_results.py" \
     --freeboard-input "${TEST_OUTPUT_DIR}/freeboard_results.csv" \
     --classification-map-output "${TEST_OUTPUT_DIR}/classification_map.png" \
     --freeboard-profile-output "${TEST_OUTPUT_DIR}/freeboard_profile.png" \
-    --summary-output "${TEST_OUTPUT_DIR}/summary_statistics.json"
+    --summary-output "${TEST_OUTPUT_DIR}/summary_statistics.json" \
+    --metrics-input "${TEST_OUTPUT_DIR}/training_metrics.json"
 
 if [ -f "${TEST_OUTPUT_DIR}/classification_map.png" ]; then
     pass "Classification map PNG created"

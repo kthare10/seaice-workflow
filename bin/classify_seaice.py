@@ -3,17 +3,18 @@
 """
 Classify sea ice types from preprocessed ATL03 segments using a trained model.
 
-Loads a trained LSTM or MLP model and runs inference on the full preprocessed
-ATL03 dataset to classify each 2m segment as thick ice, thin ice, or open water.
+Loads the LSTM or MLP from train_model.py and labels every 2 m segment as
+thick ice, thin ice, or open water. For the LSTM, windows are the same
+centered 5-segment along-track windows used in training, built per track
+(granule + beam); track ends are edge-padded so every segment is classified.
 
 Usage:
-    python classify_seaice.py --input atl03_preprocessed.csv \
-                               --model model.h5 \
+    python classify_seaice.py --input atl03_preprocessed.csv \\
+                               --model model.h5 \\
                                --output classification_results.csv
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -25,21 +26,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-FEATURE_COLUMNS = ['mean_h', 'median_h', 'std_h', 'photon_count', 'bg_rate']
+# Must match train_model.py
+FEATURE_COLUMNS = ['mean_h', 'std_h', 'pcnth', 'd_pcnt', 'bcnt', 'd_brate']
 NUM_CLASSES = 3
 CLASS_NAMES = {0: 'thick_ice', 1: 'thin_ice', 2: 'open_water'}
-SEQUENCE_LENGTH = 10
+SEQUENCE_LENGTH = 5
 
 
 def load_scaler(model_path):
     """
-    Load scaler parameters saved during training.
+    Load the StandardScaler parameters saved alongside the model.
 
     Args:
         model_path: Path to the model file (scaler saved with .scaler.npz suffix)
 
     Returns:
-        Tuple of (mean, scale) arrays
+        Tuple of (mean, scale) arrays, or (None, None) if absent
     """
     import numpy as np
 
@@ -48,33 +50,30 @@ def load_scaler(model_path):
         data = np.load(scaler_file)
         return data['mean'], data['scale']
     except FileNotFoundError:
-        logger.warning(f"Scaler file not found: {scaler_file}. Using default standardization.")
+        logger.warning(f"Scaler file not found: {scaler_file}. Features will not be standardized "
+                       "the same way as in training.")
         return None, None
 
 
-def prepare_lstm_sequences(X, seq_length=SEQUENCE_LENGTH):
+def centered_windows(X, seq_length=SEQUENCE_LENGTH):
     """
-    Create sliding window sequences for LSTM inference.
+    Centered sliding windows over one track, edge-padded so every row has one.
 
     Args:
-        X: Feature array (n_samples, n_features)
-        seq_length: Window size
+        X: Feature array (n_rows, n_features) in along-track order
+        seq_length: Window length (odd)
 
     Returns:
-        X_seq (n_sequences, seq_length, n_features), valid indices
+        Array (n_rows, seq_length, n_features)
     """
     import numpy as np
 
-    X_seq = []
-    indices = []
-    for i in range(len(X) - seq_length + 1):
-        X_seq.append(X[i:i + seq_length])
-        indices.append(i + seq_length - 1)
-    return np.array(X_seq), np.array(indices)
+    half = seq_length // 2
+    padded = np.concatenate([np.repeat(X[:1], half, axis=0), X, np.repeat(X[-1:], half, axis=0)])
+    return np.stack([padded[i:i + seq_length] for i in range(len(X))])
 
 
-def classify_seaice(input_file, model_path, output_file, batch_size=256,
-                     granule=None):
+def classify_seaice(input_file, model_path, output_file, batch_size=256, granule=None):
     """
     Run sea ice classification on preprocessed ATL03 data.
 
@@ -83,13 +82,12 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256,
         model_path: Path to trained model file
         output_file: Path to output classification CSV
         batch_size: Inference batch size
-        granule: If set, filter input to rows matching this granule ID
+        granule: If set, only rows of this granule are classified
     """
     import numpy as np
     import pandas as pd
     import tensorflow as tf
 
-    # Configure GPU: enable memory growth to avoid allocating all VRAM
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         for gpu in gpus:
@@ -102,7 +100,6 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256,
     df = pd.read_csv(input_file)
     logger.info(f"Total segments: {len(df):,}")
 
-    # Filter to a single granule when requested
     if granule is not None:
         if 'granule' not in df.columns:
             logger.error("--granule specified but input CSV has no 'granule' column")
@@ -116,66 +113,55 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256,
                          ).to_csv(output_file, index=False)
             return
 
-    # Verify required columns
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
         logger.error(f"Missing feature columns: {missing}")
         sys.exit(1)
 
-    # Extract features
-    X = df[FEATURE_COLUMNS].values
-
-    # Load and apply scaler
     scaler_mean, scaler_scale = load_scaler(model_path)
-    if scaler_mean is not None:
-        X = (X - scaler_mean) / scaler_scale
-    else:
-        X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
 
-    # Load model
     logger.info(f"Loading model from {model_path}")
     model = tf.keras.models.load_model(
-        model_path,
-        custom_objects={'focal_loss_fn': lambda y_true, y_pred: y_pred}  # Placeholder for loading
+        model_path, compile=False,
+        custom_objects={'focal_loss_fn': lambda y_true, y_pred: y_pred},
     )
     model.summary(print_fn=logger.info)
+    is_lstm = len(model.input_shape) == 3
+    logger.info(f"Detected {'LSTM' if is_lstm else 'MLP'} model")
 
-    # Detect model type from input shape
-    input_shape = model.input_shape
-    is_lstm = len(input_shape) == 3  # (batch, seq_length, features)
+    group_cols = [c for c in ('granule', 'beam') if c in df.columns]
+    predicted_class = np.full(len(df), -1, dtype=int)
+    predicted_prob = np.zeros(len(df))
 
-    if is_lstm:
-        logger.info("Detected LSTM model, preparing sequences")
-        X_input, valid_indices = prepare_lstm_sequences(X)
+    groups = df.groupby(group_cols, sort=False) if group_cols else [((None,), df)]
+    for key, g in groups:
+        g = g.sort_values('along_track_dist') if 'along_track_dist' in g.columns else g
+        X = g[FEATURE_COLUMNS].values.astype(np.float32)
+        ok = np.all(np.isfinite(X), axis=1)
+        if scaler_mean is not None:
+            X = (X - scaler_mean) / scaler_scale
+        X = np.nan_to_num(X, nan=0.0)
 
-        # Predict in batches
-        predictions = model.predict(X_input, batch_size=batch_size, verbose=1)
-        predicted_classes = np.argmax(predictions, axis=1)
-        predicted_probs = np.max(predictions, axis=1)
+        if is_lstm:
+            X_in = centered_windows(X)
+        else:
+            X_in = X
+        probs = model.predict(X_in, batch_size=batch_size, verbose=0)
+        cls = np.argmax(probs, axis=1)
+        conf = np.max(probs, axis=1)
+        cls[~ok] = -1
+        conf[~ok] = 0.0
+        predicted_class[g.index.values] = cls
+        predicted_prob[g.index.values] = conf
+        logger.info(f"  {key}: {len(g):,} segments classified")
 
-        # Map predictions back to full dataframe
-        df['predicted_class'] = -1
-        df['prediction_prob'] = 0.0
-        df.loc[valid_indices, 'predicted_class'] = predicted_classes
-        df.loc[valid_indices, 'prediction_prob'] = predicted_probs
-
-        # Fill edges with nearest valid prediction
-        df['predicted_class'] = df['predicted_class'].replace(-1, method='bfill').replace(-1, method='ffill')
-        df['prediction_prob'] = df['prediction_prob'].replace(0.0, method='bfill').replace(0.0, method='ffill')
-    else:
-        logger.info("Detected MLP model")
-        predictions = model.predict(X, batch_size=batch_size, verbose=1)
-        df['predicted_class'] = np.argmax(predictions, axis=1)
-        df['prediction_prob'] = np.max(predictions, axis=1)
-
-    # Add class name
+    df['predicted_class'] = predicted_class
+    df['prediction_prob'] = predicted_prob
     df['predicted_label'] = df['predicted_class'].map(CLASS_NAMES)
 
-    # Save results
     df.to_csv(output_file, index=False)
     logger.info(f"Classification results saved to {output_file}")
 
-    # Summary
     class_counts = df['predicted_class'].value_counts().sort_index()
     print(f"\n{'='*70}")
     print("SEA ICE CLASSIFICATION COMPLETE")
@@ -203,7 +189,7 @@ Examples:
     parser.add_argument("--input", type=str, required=True,
                         help="Input preprocessed ATL03 CSV file")
     parser.add_argument("--model", type=str, required=True,
-                        help="Trained model file (HDF5)")
+                        help="Trained model file")
     parser.add_argument("--output", type=str, default="classification_results.csv",
                         help="Output classification CSV (default: classification_results.csv)")
     parser.add_argument("--granule", type=str, default=None,
@@ -214,6 +200,8 @@ Examples:
     try:
         classify_seaice(args.input, args.model, args.output, granule=args.granule)
         logger.info("Classification completed successfully")
+    except SystemExit:
+        raise
     except Exception as e:
         logger.error(f"Failed to classify sea ice: {e}")
         import traceback

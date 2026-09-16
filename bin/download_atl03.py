@@ -27,8 +27,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Predefined regions with bounding boxes [min_lon, min_lat, max_lon, max_lat]
+# The paper uses ATL03 release 006
+ATL03_VERSION = "006"
+
 REGIONS = {
-    'ross_sea': (-180, -78, -150, -60),
+    'ross_sea': (-180, -78, -140, -70),  # Iqrah et al. 2025, Sec. III.A.1
     'weddell_sea': (-60, -78, 0, -60),
     'beaufort_sea': (-160, 68, -120, 80),
     'arctic_ocean': (-180, 65, 180, 90),
@@ -36,10 +39,36 @@ REGIONS = {
 }
 
 
+# GPS runs ahead of UTC by the accumulated leap seconds: 18 s since 2017-01-01
+# (no leap second has been added since). Needed to turn ATL03 delta_time into UTC.
+GPS_UTC_LEAP_SECONDS = 18
+GPS_EPOCH = datetime(1980, 1, 6)
+
+
+def _delta_time_to_utc(delta_time, atlas_sdp_gps_epoch):
+    """
+    Convert ATL03 delta_time (seconds since the ATLAS SDP epoch) to UTC.
+
+    Args:
+        delta_time: Seconds since the ATLAS SDP epoch
+        atlas_sdp_gps_epoch: GPS seconds from the GPS epoch to the SDP epoch
+            (from /ancillary_data/atlas_sdp_gps_epoch)
+
+    Returns:
+        datetime in UTC
+    """
+    gps_seconds = float(atlas_sdp_gps_epoch) + float(delta_time)
+    return GPS_EPOCH + timedelta(seconds=gps_seconds - GPS_UTC_LEAP_SECONDS)
+
+
 def _write_track_bbox(h5_path, bbox_path="atl03_bbox.json", pad_deg=0.5):
     """
-    Compute the bounding box of all photon tracks in an ATL03 HDF5 file
-    and write it to a JSON file for use by downstream jobs (e.g. S2 download).
+    Write the track bounding box and per-granule overpass times to JSON.
+
+    Downstream, download_sentinel2.py uses the per-granule bbox and UTC time
+    window to find Sentinel-2 scenes coincident with each ICESat-2 pass
+    (the paper uses an 80-minute window), rather than any scene in the date
+    range.
 
     Args:
         h5_path: Path to the merged ATL03 HDF5 file
@@ -51,35 +80,63 @@ def _write_track_bbox(h5_path, bbox_path="atl03_bbox.json", pad_deg=0.5):
     import h5py
     import numpy as np
 
-    min_lat, max_lat = 90.0, -90.0
-    min_lon, max_lon = 180.0, -180.0
-
+    granules = []
     with h5py.File(h5_path, 'r') as h5:
-        for gname in h5.keys():
+        for gname in sorted(h5.keys()):
             if not gname.startswith('granule_'):
                 continue
-            for beam in ['gt1l', 'gt2l', 'gt3l']:
-                lat_path = f"{gname}/{beam}/lat_ph"
-                lon_path = f"{gname}/{beam}/lon_ph"
-                if lat_path in h5 and lon_path in h5:
-                    lat = h5[lat_path][:]
-                    lon = h5[lon_path][:]
-                    min_lat = min(min_lat, float(np.min(lat)))
-                    max_lat = max(max_lat, float(np.max(lat)))
-                    min_lon = min(min_lon, float(np.min(lon)))
-                    max_lon = max(max_lon, float(np.max(lon)))
+            g = h5[gname]
+            epoch = None
+            if 'ancillary_data/atlas_sdp_gps_epoch' in g:
+                epoch = float(np.ravel(g['ancillary_data/atlas_sdp_gps_epoch'][()])[0])
+
+            lats, lons, times = [], [], []
+            for beam in g.keys():
+                if not beam.startswith('gt') or 'lat_ph' not in g[beam]:
+                    continue
+                lats.append(g[beam]['lat_ph'][:])
+                lons.append(g[beam]['lon_ph'][:])
+                if 'delta_time' in g[beam]:
+                    times.append(g[beam]['delta_time'][:])
+            if not lats:
+                continue
+            lat = np.concatenate(lats)
+            lon = np.concatenate(lons)
+            entry = {
+                'granule': gname,
+                'source_file': str(g.attrs.get('source_file', '')),
+                'strong_beams': str(g.attrs.get('strong_beams', '')).split(','),
+                'min_lon': float(np.min(lon)) - pad_deg,
+                'min_lat': float(np.min(lat)) - pad_deg,
+                'max_lon': float(np.max(lon)) + pad_deg,
+                'max_lat': float(np.max(lat)) + pad_deg,
+            }
+            if times and epoch is not None:
+                dt = np.concatenate(times)
+                entry['start_utc'] = _delta_time_to_utc(np.min(dt), epoch).isoformat() + 'Z'
+                entry['end_utc'] = _delta_time_to_utc(np.max(dt), epoch).isoformat() + 'Z'
+            else:
+                logger.warning(f"{gname}: no delta_time/epoch, overpass time unavailable")
+            granules.append(entry)
+
+    if not granules:
+        logger.error("No photon data found in merged file; cannot write track bbox")
+        sys.exit(1)
 
     bbox = {
-        "min_lon": round(min_lon - pad_deg, 4),
-        "min_lat": round(min_lat - pad_deg, 4),
-        "max_lon": round(max_lon + pad_deg, 4),
-        "max_lat": round(max_lat + pad_deg, 4),
+        'min_lon': min(g['min_lon'] for g in granules),
+        'min_lat': min(g['min_lat'] for g in granules),
+        'max_lon': max(g['max_lon'] for g in granules),
+        'max_lat': max(g['max_lat'] for g in granules),
+        'granules': granules,
     }
-
     with open(bbox_path, 'w') as f:
         json.dump(bbox, f, indent=2)
 
-    logger.info(f"Track bounding box: {bbox}")
+    extent = {k: bbox[k] for k in ('min_lon', 'min_lat', 'max_lon', 'max_lat')}
+    logger.info(f"Track bounding box: {extent}")
+    for g in granules:
+        logger.info(f"  {g['granule']}: {g.get('start_utc', '?')} .. {g.get('end_utc', '?')} beams={g['strong_beams']}")
     logger.info(f"Saved to {bbox_path}")
 
 
@@ -170,6 +227,7 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None,
     # Search for ATL03 granules (CMR search works without login)
     results = earthaccess.search_data(
         short_name="ATL03",
+        version=ATL03_VERSION,
         bounding_box=bbox,
         temporal=(start_date, end_date),
     )
@@ -248,6 +306,93 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None,
     )
 
 
+# Datasets copied per strong beam into the merged file. Photon-level fields
+# (heights) are stored flat under the beam group; the 20 m segment-rate groups
+# keep their ATL03 group names so preprocess_atl03.py can align them.
+HEIGHTS_KEYS = ['h_ph', 'lat_ph', 'lon_ph', 'signal_conf_ph', 'quality_ph',
+                'delta_time', 'dist_ph_along', 'ph_id_pulse', 'pce_mframe_cnt']
+GEOLOCATION_KEYS = ['segment_id', 'segment_dist_x', 'segment_length',
+                    'segment_ph_cnt', 'ph_index_beg', 'delta_time',
+                    'reference_photon_lat', 'reference_photon_lon']
+# tide_ocean and dem_h(MSS) are what the height correction needs; the rest are
+# kept for reference. None of these are applied to h_ph in the ATL03 product.
+GEOPHYS_KEYS = ['delta_time', 'tide_ocean', 'dem_h', 'dem_flag', 'geoid', 'dac']
+BCKGRD_KEYS = ['delta_time', 'bckgrd_rate', 'bckgrd_counts']
+
+ALL_BEAMS = ['gt1l', 'gt1r', 'gt2l', 'gt2r', 'gt3l', 'gt3r']
+
+
+def _select_strong_beams(in_h5):
+    """
+    Return the three strong beam names of an ATL03 granule.
+
+    Prefers the ``atlas_beam_type`` attribute on each beam group. Falls back
+    to ``orbit_info/sc_orient`` (0 = backward: left beams strong; 1 = forward:
+    right beams strong). Exits if neither is available, rather than guessing.
+
+    Args:
+        in_h5: Open ATL03 h5py File
+
+    Returns:
+        List of strong beam group names present in the file
+    """
+    strong = []
+    for beam in ALL_BEAMS:
+        if beam not in in_h5:
+            continue
+        btype = in_h5[beam].attrs.get('atlas_beam_type')
+        if btype is None:
+            strong = None
+            break
+        if isinstance(btype, bytes):
+            btype = btype.decode()
+        if str(btype).strip().lower() == 'strong':
+            strong.append(beam)
+
+    if strong is not None:
+        logger.info(f"Strong beams (atlas_beam_type): {strong}")
+        return strong
+
+    sc_orient = None
+    if 'orbit_info/sc_orient' in in_h5:
+        sc_orient = int(in_h5['orbit_info/sc_orient'][()].ravel()[0])
+    if sc_orient == 0:
+        strong = [b for b in ALL_BEAMS if b.endswith('l') and b in in_h5]
+    elif sc_orient == 1:
+        strong = [b for b in ALL_BEAMS if b.endswith('r') and b in in_h5]
+    else:
+        logger.error(
+            "Cannot determine strong beams: no atlas_beam_type attribute and "
+            f"sc_orient={sc_orient} (expected 0 or 1)"
+        )
+        sys.exit(1)
+    logger.info(f"Strong beams (sc_orient={sc_orient}): {strong}")
+    return strong
+
+
+def _copy_datasets(beam_grp, src_name, out_beam, dst_name, keys):
+    """
+    Copy selected datasets from one ATL03 beam subgroup into the merged file.
+
+    Args:
+        beam_grp: Source beam group
+        src_name: Source subgroup name (e.g. 'heights')
+        out_beam: Destination beam group
+        dst_name: Destination subgroup name, or None to store flat
+        keys: Dataset names to copy when present
+    """
+    if src_name not in beam_grp:
+        logger.warning(f"  {beam_grp.name}: no {src_name} group")
+        return
+    src = beam_grp[src_name]
+    dst = out_beam.create_group(dst_name) if dst_name else out_beam
+    for key in keys:
+        if key in src:
+            dst.create_dataset(key, data=src[key][:])
+        else:
+            logger.warning(f"  {beam_grp.name}/{src_name}: missing {key}")
+
+
 def _merge_granules(granule_files, output_file, region, bbox, start_date, end_date):
     """
     Merge a list of ATL03 HDF5 granules into a single workflow-format HDF5 file.
@@ -266,9 +411,10 @@ def _merge_granules(granule_files, output_file, region, bbox, start_date, end_da
     """
     import h5py
 
-    # Merge into a single output HDF5 file
-    strong_beams = ['gt1l', 'gt2l', 'gt3l']
-
+    # Merge into a single output HDF5 file. Only the strong beams are kept,
+    # selected per granule from the beam group's atlas_beam_type attribute
+    # (falling back to orbit_info/sc_orient), since which of gtNl/gtNr is
+    # strong depends on spacecraft orientation.
     with h5py.File(output_file, 'w') as out_h5:
         granule_count = 0
         for fpath in granule_files:
@@ -279,37 +425,29 @@ def _merge_granules(granule_files, output_file, region, bbox, start_date, end_da
             try:
                 with h5py.File(fpath, 'r') as in_h5:
                     granule_grp = out_h5.create_group(f"granule_{granule_count:04d}")
-                    # Copy metadata
+                    granule_grp.attrs['source_file'] = Path(fpath).name
+                    # Copy metadata: ancillary_data carries the CAL-19 first-photon
+                    # bias and CAL-42 dead-time tables; orbit_info carries sc_orient
                     if 'ancillary_data' in in_h5:
                         in_h5.copy('ancillary_data', granule_grp)
                     if 'orbit_info' in in_h5:
                         in_h5.copy('orbit_info', granule_grp)
 
+                    strong_beams = _select_strong_beams(in_h5)
+                    granule_grp.attrs['strong_beams'] = ','.join(strong_beams)
+
                     for beam in strong_beams:
-                        if beam not in in_h5:
-                            continue
                         beam_grp = in_h5[beam]
                         if 'heights' not in beam_grp:
                             continue
 
                         out_beam = granule_grp.create_group(beam)
-                        heights = beam_grp['heights']
-
-                        # Copy photon-level data
-                        for key in ['h_ph', 'lat_ph', 'lon_ph', 'signal_conf_ph',
-                                    'delta_time', 'dist_ph_along']:
-                            if key in heights:
-                                out_beam.create_dataset(key, data=heights[key][:])
-
-                        # Copy geolocation data if available
-                        if 'geolocation' in beam_grp:
-                            geo = beam_grp['geolocation']
-                            out_geo = out_beam.create_group('geolocation')
-                            for key in ['segment_id', 'segment_dist_x',
-                                        'segment_ph_cnt', 'reference_photon_lat',
-                                        'reference_photon_lon']:
-                                if key in geo:
-                                    out_geo.create_dataset(key, data=geo[key][:])
+                        for k, v in beam_grp.attrs.items():
+                            out_beam.attrs[k] = v
+                        _copy_datasets(beam_grp, 'heights', out_beam, None, HEIGHTS_KEYS)
+                        _copy_datasets(beam_grp, 'geolocation', out_beam, 'geolocation', GEOLOCATION_KEYS)
+                        _copy_datasets(beam_grp, 'geophys_corr', out_beam, 'geophys_corr', GEOPHYS_KEYS)
+                        _copy_datasets(beam_grp, 'bckgrd_atlas', out_beam, 'bckgrd_atlas', BCKGRD_KEYS)
 
                     granule_count += 1
             except Exception as e:

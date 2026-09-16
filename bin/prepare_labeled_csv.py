@@ -14,14 +14,24 @@ Input columns are mapped as follows:
     lat              <- lat
     lon              <- lon
     along_track_dist <- x_atc
-    mean_h           <- h_cor_mean   (geoid/tide/DAC/MSS-corrected height)
+    mean_h           <- h_cor_mean   (= height_mean - mss - tide - fpb_corr)
     median_h         <- h_cor_med
     std_h            <- height_sd
     photon_count     <- N
-    bg_rate          <- brate_mean
+    pcnt             <- pcnt_mean    (photons per shot)
+    pcnth            <- pcnth_mean   (high-confidence photons per shot)
+    bcnt             <- bcnt_mean    (ATL03 50-shot background counts)
+    brate            <- brate_mean   (ATL03 background rate, counts/s)
+    d_pcnt, d_brate  <- along-track first differences of pcnt, brate
     beam             <- parsed from the file name (gt1l/gt1r/.../gt3r)
     granule          <- parsed from the file name
     label            <- label
+
+The six model features (train_model.py FEATURE_COLUMNS) are mean_h, std_h,
+pcnth, d_pcnt, bcnt, d_brate, following the paper's list "height/elevation,
+height standard deviation, high-confidence photon, photon rate changes,
+background photon, background photon rate changes". Interpreting "changes" as
+the first difference along track is this implementation's reading.
 
 The corrected heights (h_cor_*) are used rather than the raw ellipsoidal
 heights (height_*), because the freeboard stage expects sea-surface-referenced
@@ -50,24 +60,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Workflow schema -> candidate source columns, in order of preference
+# Workflow schema -> candidate source columns, in order of preference.
+# Matches OUTPUT_COLUMNS of bin/preprocess_atl03.py so both input paths feed
+# the model the same features.
 COLUMN_MAP = {
     'lat': ['lat'],
     'lon': ['lon'],
     'along_track_dist': ['x_atc', 'along_track_dist'],
     'mean_h': ['h_cor_mean', 'height_mean'],
     'median_h': ['h_cor_med', 'height_med'],
-    'std_h': ['height_sd', 'h_cor_sd'],
+    'std_h': ['height_sd', 'h_cor_sd', 'std_h'],
     'photon_count': ['N', 'photon_count'],
-    'bg_rate': ['brate_mean', 'bg_rate'],
+    'pcnt': ['pcnt_mean', 'pcnt'],        # photons per shot
+    'pcnth': ['pcnth_mean', 'pcnth'],     # high-confidence photons per shot
+    'bcnt': ['bcnt_mean', 'bcnt'],        # ATL03 50-shot background counts
+    'brate': ['brate_mean', 'brate'],     # ATL03 background rate (counts/s)
+    'height_mean_uncor': ['height_mean'],
+    'height_med_uncor': ['height_med'],
+    'mss': ['mss'],
+    'tide_ocean': ['tide', 'tide_ocean'],
+    'fpb_corr': ['fpb_corr'],
     'label': ['label'],
 }
+# Optional columns: absent sources are filled with NaN instead of failing
+OPTIONAL_TARGETS = {'height_mean_uncor', 'height_med_uncor', 'mss', 'tide_ocean', 'fpb_corr'}
 
 # Columns whose preferred source is a corrected height; warn when falling back
 CORRECTED_HEIGHT_COLUMNS = {'mean_h', 'median_h'}
 
-OUTPUT_COLUMNS = ['lat', 'lon', 'along_track_dist', 'mean_h', 'median_h',
-                  'std_h', 'photon_count', 'bg_rate', 'beam', 'granule', 'label']
+OUTPUT_COLUMNS = [
+    'lat', 'lon', 'along_track_dist',
+    'mean_h', 'median_h', 'std_h',
+    'photon_count', 'pcnt', 'pcnth', 'd_pcnt',
+    'bcnt', 'brate', 'd_brate', 'bg_rate',
+    'height_mean_uncor', 'height_med_uncor', 'mss', 'tide_ocean', 'fpb_corr',
+    'beam', 'granule', 'label',
+]
 
 BEAM_RE = re.compile(r'(gt[1-3][lr])', re.IGNORECASE)
 
@@ -124,6 +152,9 @@ def harmonize_file(path):
     out = pd.DataFrame()
     for target, candidates in COLUMN_MAP.items():
         source = next((c for c in candidates if c in df.columns), None)
+        if source is None and target in OPTIONAL_TARGETS:
+            out[target] = float('nan')
+            continue
         if source is None:
             raise ValueError(
                 f"{Path(path).name}: no source column for '{target}' "
@@ -139,6 +170,13 @@ def harmonize_file(path):
 
     out['beam'] = beam_name(path)
     out['granule'] = granule_key(path)
+    out['bg_rate'] = out['brate']
+
+    # Rate-of-change features (paper: "photon rate changes", "background photon
+    # rate changes"): first difference along track within the file's track
+    out = out.sort_values('along_track_dist').reset_index(drop=True)
+    out['d_pcnt'] = out['pcnt'].diff().fillna(0.0)
+    out['d_brate'] = out['brate'].diff().fillna(0.0)
 
     return out[OUTPUT_COLUMNS]
 
@@ -178,7 +216,7 @@ def prepare_labeled_csv(input_dir, output_file, labeled_output):
     # Drop rows the labeling step could not assign (label -1) or with no height
     before = len(df)
     df = df[df['label'] >= 0]
-    df = df.dropna(subset=['mean_h', 'median_h', 'std_h', 'photon_count', 'bg_rate'])
+    df = df.dropna(subset=['mean_h', 'std_h', 'pcnth', 'd_pcnt', 'bcnt', 'd_brate'])
     df = df.reset_index(drop=True)
     if len(df) < before:
         logger.info(f"Dropped {before - len(df):,} unlabeled/incomplete segments")

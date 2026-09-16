@@ -40,24 +40,29 @@ CLASS_NAMES = {0: 'Thick Ice', 1: 'Thin Ice', 2: 'Open Water'}
 CLASS_COLORS = {0: '#1f77b4', 1: '#2ca02c', 2: '#ff7f0e'}
 
 
-def plot_classification_map(df, output_file):
+def plot_classification_map(df, output_file, held_out=None):
     """
     Generate a multi-panel classification figure (paper Figs. 4, 6a):
 
     (a) ATL03 elevation vs along-track longitude colored by ice type
     (b) Geographic classification map (lat vs lon)
-    (c) Confusion matrix heatmap (if ground-truth labels are available)
+    (c) Confusion matrix heatmap. Uses the held-out (20%) test-set matrix
+        from training_metrics.json when available, which is what the paper's
+        Fig. 4 / Table III report; otherwise falls back to all classified
+        segments that carry a truth label (which includes training data).
 
     Args:
         df: DataFrame with lat, lon, mean_h, predicted_class columns
         output_file: Output PNG file path
+        held_out: Optional dict from training_metrics.json['held_out']
     """
     import numpy as np
 
     has_truth = 'label' in df.columns or 'true_class' in df.columns
     truth_col = 'label' if 'label' in df.columns else 'true_class' if 'true_class' in df.columns else None
+    has_held_out = bool(held_out and held_out.get('confusion_matrix'))
 
-    ncols = 3 if has_truth else 2
+    ncols = 3 if (has_truth or has_held_out) else 2
     fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 5))
 
     # Custom legend handles
@@ -111,15 +116,20 @@ def plot_classification_map(df, output_file):
                 fontsize=13, fontweight='bold', va='bottom')
 
     # --- Panel (c): Confusion matrix (Fig. 4) ---
-    if has_truth and truth_col:
-        from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+    if has_held_out or (has_truth and truth_col):
         ax_cm = axes[2]
 
-        y_true = df[truth_col].values
-        y_pred = df['predicted_class'].values
-        labels = sorted(set(y_true) | set(y_pred))
-
-        cm = sk_confusion_matrix(y_true, y_pred, labels=labels)
+        if has_held_out:
+            cm = np.asarray(held_out['confusion_matrix'])
+            labels = list(range(cm.shape[0]))
+            cm_title = f"Confusion Matrix, held-out 20% (n={held_out.get('n_samples', '?'):,})"
+        else:
+            from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+            y_true = df[truth_col].values
+            y_pred = df['predicted_class'].values
+            labels = sorted(set(y_true) | set(y_pred))
+            cm = sk_confusion_matrix(y_true, y_pred, labels=labels)
+            cm_title = 'Confusion Matrix, all segments (incl. training data)'
         # Normalize to percentages per row
         cm_pct = cm.astype(float)
         row_sums = cm.sum(axis=1, keepdims=True)
@@ -144,7 +154,7 @@ def plot_classification_map(df, output_file):
         ax_cm.set_xticklabels(pred_labels, fontsize=9, rotation=20, ha='right')
         ax_cm.set_yticks(range(len(labels)))
         ax_cm.set_yticklabels(tick_labels, fontsize=9)
-        ax_cm.set_title('Confusion Matrix (Percentages)', fontsize=12, fontweight='bold')
+        ax_cm.set_title(cm_title, fontsize=11, fontweight='bold')
         ax_cm.text(-0.02, 1.05, '(c)', transform=ax_cm.transAxes,
                    fontsize=13, fontweight='bold', va='bottom')
 
@@ -291,13 +301,14 @@ def plot_freeboard_profile(df, output_file):
     logger.info(f"Freeboard profile saved to {output_file}")
 
 
-def compute_summary_statistics(cls_df, fb_df):
+def compute_summary_statistics(cls_df, fb_df, metrics=None):
     """
     Compute summary statistics for the analysis.
 
     Args:
         cls_df: Classification results DataFrame
         fb_df: Freeboard results DataFrame
+        metrics: Optional parsed training_metrics.json
 
     Returns:
         Dictionary of summary statistics
@@ -329,11 +340,30 @@ def compute_summary_statistics(cls_df, fb_df):
     if 'prediction_prob' in cls_df.columns:
         stats['classification']['mean_confidence'] = float(cls_df['prediction_prob'].mean())
 
-    # Per-class accuracy (if ground-truth available)
+    # Held-out test-set metrics from training (paper Table III / Fig. 4)
+    if metrics and metrics.get('held_out'):
+        ho = metrics['held_out']
+        stats['held_out_evaluation'] = {
+            'note': 'Stratified 20% test split of track windows, from training_metrics.json',
+            'model_type': metrics.get('model_type'),
+            'features': metrics.get('features'),
+            'n_samples': ho.get('n_samples'),
+            'accuracy': ho.get('accuracy'),
+            'precision_macro': ho.get('precision_macro'),
+            'recall_macro': ho.get('recall_macro'),
+            'f1_macro': ho.get('f1_macro'),
+            'per_class': ho.get('per_class'),
+            'confusion_matrix': ho.get('confusion_matrix'),
+            'confusion_matrix_labels': ho.get('confusion_matrix_labels'),
+        }
+
+    # Per-class agreement over ALL classified segments (includes training data)
     truth_col = 'label' if 'label' in cls_df.columns else 'true_class' if 'true_class' in cls_df.columns else None
     if truth_col:
         overall_acc = float((cls_df[truth_col] == cls_df['predicted_class']).mean())
         stats['classification']['accuracy'] = overall_acc
+        stats['classification']['accuracy_note'] = 'Agreement over all segments with a label, including those used for training'
+
         for cls_val in sorted(cls_df['predicted_class'].unique()):
             mask = cls_df[truth_col] == cls_val
             if mask.sum() > 0:
@@ -370,7 +400,7 @@ def compute_summary_statistics(cls_df, fb_df):
 
 def visualize_results(classification_input, freeboard_input,
                       classification_map_output, freeboard_profile_output,
-                      summary_output):
+                      summary_output, metrics_input=None):
     """
     Generate all visualizations and summary statistics.
 
@@ -380,9 +410,18 @@ def visualize_results(classification_input, freeboard_input,
         classification_map_output: Output PNG for classification map
         freeboard_profile_output: Output PNG for freeboard profile
         summary_output: Output JSON for summary statistics
+        metrics_input: Optional training_metrics.json with held-out metrics
     """
-    import numpy as np
     import pandas as pd
+
+    metrics = None
+    if metrics_input:
+        try:
+            with open(metrics_input) as f:
+                metrics = json.load(f)
+            logger.info(f"Loaded training metrics from {metrics_input}")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not read {metrics_input}: {e}; held-out metrics unavailable")
 
     logger.info(f"Loading classification results from {classification_input}")
     cls_df = pd.read_csv(classification_input)
@@ -394,7 +433,8 @@ def visualize_results(classification_input, freeboard_input,
 
     # Generate classification map
     logger.info("Generating classification map...")
-    plot_classification_map(cls_df, classification_map_output)
+    plot_classification_map(cls_df, classification_map_output,
+                            held_out=(metrics or {}).get('held_out'))
 
     # Generate freeboard profile
     logger.info("Generating freeboard profile...")
@@ -402,7 +442,7 @@ def visualize_results(classification_input, freeboard_input,
 
     # Compute and save summary statistics
     logger.info("Computing summary statistics...")
-    stats = compute_summary_statistics(cls_df, fb_df)
+    stats = compute_summary_statistics(cls_df, fb_df, metrics)
 
     with open(summary_output, 'w') as f:
         json.dump(stats, f, indent=2)
@@ -423,7 +463,12 @@ def visualize_results(classification_input, freeboard_input,
                 line += f"  [accuracy: {cls_stats['accuracy']:.2%}]"
             print(line)
     if 'accuracy' in stats['classification']:
-        print(f"  Overall accuracy: {stats['classification']['accuracy']:.2%}")
+        print(f"  Agreement over all labeled segments (incl. training): {stats['classification']['accuracy']:.2%}")
+    if 'held_out_evaluation' in stats:
+        ho = stats['held_out_evaluation']
+        print(f"\nHeld-out 20% test set ({ho['n_samples']:,} windows, {ho['model_type']}):")
+        print(f"  accuracy={ho['accuracy']:.4f}  precision={ho['precision_macro']:.4f}  "
+              f"recall={ho['recall_macro']:.4f}  F1={ho['f1_macro']:.4f}")
     if 'all_ice' in stats['freeboard']:
         fb = stats['freeboard']['all_ice']
         print(f"\nFreeboard (all ice):")
@@ -466,6 +511,9 @@ Examples:
     parser.add_argument("--summary-output", type=str,
                         default="summary_statistics.json",
                         help="Output summary statistics JSON")
+    parser.add_argument("--metrics-input", type=str, default=None,
+                        help="training_metrics.json from train_model.py; supplies the held-out "
+                             "confusion matrix and precision/recall/F1 (paper Fig. 4, Table III)")
 
     args = parser.parse_args()
 
@@ -476,6 +524,7 @@ Examples:
             classification_map_output=args.classification_map_output,
             freeboard_profile_output=args.freeboard_profile_output,
             summary_output=args.summary_output,
+            metrics_input=args.metrics_input,
         )
         logger.info("Visualization completed successfully")
     except Exception as e:
