@@ -27,6 +27,8 @@ transformations.yml
 
 # Claude
 .claude/
+CC_USAGE_LOG.md
+cc-usage-log.md
 
 # OS
 .DS_Store
