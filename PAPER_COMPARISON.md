@@ -22,7 +22,8 @@ Items marked ■ change the science, not just the numbers.
 **Status (2026-09-16, fix pass):** every finding below carries a status line.
 ✅ = implemented as the paper states; 🔶 = implemented with a documented choice where
 the paper is silent; ❌ = not reproducible / out of scope, kept as a known gap.
-Section 9 summarizes the resulting numbers on the authors' labeled data.
+Section 9 records the reproduction numbers from a full cluster run on the authors'
+labeled data.
 
 ---
 
@@ -233,37 +234,56 @@ is fixed to the workflow's 5 features.
 
 ---
 
-## 9. Results after the fix pass (authors' labeled data, 6 tracks, 139,335 segments)
+## 9. Reproduction results (authors' labeled data, 6 tracks, 139,335 segments)
 
-Reproduction run on the `IS2_Corrected_data` files via `--labeled-csv-dir` semantics
-(harmonize → train → classify → freeboard → visualize), LSTM, 20 epochs, batch 32,
-CPU. 139,311 centered windows; stratified 80/20 split (111,448 / 27,863).
+Full Pegasus run on the FABRIC cluster (`run0004`, 33/33 jobs), labeled-CSV mode:
+harmonize → train → classify (6-way fan-out) → merge → freeboard → visualize. LSTM,
+20 epochs, batch 32, 139,311 centered windows, stratified 80/20 split
+(111,448 / 27,863). `train_model` ran on a real GPU (`/physical_device:GPU:0`).
 
-| | Paper (Table III / Fig. 4) | This code (held-out 20 %) |
+### Classification, held-out 20 % (paper Table III / Fig. 4)
+
+| | Paper | This run |
 |---|---|---|
-| Accuracy | 96.56 % | **94.96 %** |
-| Precision | 97.00 % (averaging unspecified) | 79.2 % macro / 94.5 % weighted |
-| Recall | 96.09 % | 61.0 % macro / 95.0 % weighted |
-| F1 | 96.54 % | 67.0 % macro / 94.6 % weighted |
-| Thick-ice recall | 98.39 % | 99.33 % |
-| Thin-ice recall | 73.80 % | 50.65 % |
-| Open-water recall | 60.25 % | 32.96 % |
+| Accuracy | 96.56 % | **95.26 %** |
+| Precision | 97.00 % (averaging unspecified) | 75.8 % macro / 95.1 % weighted |
+| Recall | 96.09 % | 68.2 % macro / 95.3 % weighted |
+| F1 | 96.54 % | 71.5 % macro / 95.1 % weighted |
+| Thick-ice recall | 98.39 % | **98.83 %** |
+| Thin-ice recall | 73.80 % | 56.98 % |
+| Open-water recall | 60.25 % | 48.80 % |
 
-The remaining gap is concentrated in the two minority classes (5.5 % and 2.5 % of
-segments). Candidate causes that are *not* settled by the paper: focal-loss
-parameters (unspecified; a uniform α does not re-weight classes), the exact feature
-definitions (Sec. 4), and the paper's manual label corrections in transition and
-cloudy regions, which this automated pipeline cannot apply.
+Over all 139,335 segments the predicted class mix is 93.3 % / 4.8 % / 1.9 %
+(thick / thin / water) against a 92.0 % / 5.5 % / 2.5 % truth mix, and agreement is
+95.43 %.
 
-Freeboard on the same data (Eqs. 1–3): thick ice mean 0.63 m / median 0.59 m, thin
-ice 0.013 m, open-water residual +0.02 ± 0.04 m; 5 of 6 tracks have leads (the
-698-segment `T02CNA_gt2r` track has none and gets no freeboard).
+Accuracy lands 1.3 points under the paper and thick-ice recall slightly above it; the
+shortfall is entirely in the two minority classes. Causes the paper does not settle:
+focal-loss parameters (unspecified, and a scalar alpha does not re-weight classes), the
+exact feature definitions (Sec. 4), and the manual label corrections the authors applied
+in transition and cloudy regions, which an automated pipeline cannot reproduce.
 
-**Not yet verified against a real ATL03 granule** (no Earthdata credentials were
-available during the fix pass): the `atlas_beam_type` attribute, `dem_flag == 3`
-as the MSS source, the CAL-19 / CAL-42 table layout, and the `bckgrd_atlas`
-alignment. All four were implemented from the ATL03 v006 data dictionary and
-exercised on synthetic granules with that structure.
+### Freeboard (Eqs. 1-3)
+
+Thick ice mean 0.655 m / median 0.612 m; thin ice mean 0.041 m / median 0.034 m. Thin
+ice sitting an order of magnitude below thick ice is the expected physical ordering and
+is the main sanity check on the height correction chain.
+
+### Not verified against a real ATL03 granule
+
+No Earthdata credentials were available, so the raw-ATL03 path ran only against synthetic
+granules built to the v006 data dictionary: the `atlas_beam_type` attribute,
+`dem_flag == 3` as the MSS source, the CAL-19 / CAL-42 table layout, and `bckgrd_atlas`
+alignment. The labeled-CSV path above does not exercise any of them.
+
+### A failure mode worth recording
+
+An earlier run of this same configuration (`run0003`) reported 33/33 success while
+producing 89.9 % open water and 11 % agreement. `train_model` declared only `model.h5`
+and `training_metrics.json` as outputs, so the `model.scaler.npz` written beside the
+model never reached the classify jobs; they warned, standardized nothing, and fed raw
+features to a model trained on standardized ones. The warning did not fail the job, so
+the DAG went green. `classify_seaice.py` now exits non-zero when the scaler is absent.
 
 ## Fix priority (original, for reference)
 
