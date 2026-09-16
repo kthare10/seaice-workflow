@@ -39,6 +39,7 @@ import argparse
 import glob
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,21 @@ from Pegasus.api import *
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def granule_key_from_csv(path):
+    """Derive a granule key from a pre-labeled CSV file name.
+
+    Must match ``granule_key()`` in bin/prepare_labeled_csv.py, since the
+    classify jobs filter the harmonized data by this value.
+
+    Args:
+        path: Path to the labeled CSV file
+
+    Returns:
+        Granule key string
+    """
+    return re.sub(r"_labeled.*$", "", Path(path).stem)
 
 
 class SeaIceWorkflow:
@@ -205,6 +221,14 @@ class SeaIceWorkflow:
             container=seaice_container,
         ).add_pegasus_profile(memory="4 GB")
 
+        prepare_labeled_csv = Transformation(
+            "prepare_labeled_csv",
+            site=exec_site_name,
+            pfn=os.path.join(self.wf_dir, "bin/prepare_labeled_csv.py"),
+            is_stageable=True,
+            container=seaice_container,
+        ).add_pegasus_profile(memory="8 GB")
+
         merge_classifications = Transformation(
             "merge_classifications",
             site=exec_site_name,
@@ -224,18 +248,29 @@ class SeaIceWorkflow:
             calculate_freeboard,
             visualize_results,
             merge_classifications,
+            prepare_labeled_csv,
         )
 
-    def create_replica_catalog(self, test_mode=False, local_atl03_files=None):
+    def create_replica_catalog(self, test_mode=False, local_atl03_files=None,
+                               labeled_csv_files=None):
         """Create replica catalog.
 
         Args:
             test_mode: Register synthetic test data instead of downloading.
             local_atl03_files: Optional list of already-downloaded ATL03 .h5
                 granule paths to register as workflow inputs.
+            labeled_csv_files: Optional list of pre-labeled ATL03 segment CSV
+                paths to register as workflow inputs.
         """
         logger.info("Creating replica catalog")
         self.rc = ReplicaCatalog()
+
+        if labeled_csv_files:
+            for path in labeled_csv_files:
+                self.rc.add_replica("local", os.path.basename(path), "file://" + path)
+            logger.info(
+                f"Registered {len(labeled_csv_files)} pre-labeled CSV file(s)"
+            )
 
         if local_atl03_files:
             for path in local_atl03_files:
@@ -264,7 +299,7 @@ class SeaIceWorkflow:
                         model_type="lstm", earthdata_token=None,
                         earthdata_username=None, earthdata_password=None,
                         test_mode=False, max_granules=None, max_scenes=None,
-                        local_atl03_files=None):
+                        local_atl03_files=None, labeled_csv_files=None):
         """Create the workflow DAG."""
         logger.info("Creating workflow DAG")
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
@@ -283,7 +318,32 @@ class SeaIceWorkflow:
         freeboard_profile = File("freeboard_profile.png")
         summary_stats = File("summary_statistics.json")
 
-        if test_mode:
+        if labeled_csv_files:
+            # Pre-labeled segment CSVs replace the download, preprocess, and
+            # auto-label stages entirely: one job harmonizes them into the
+            # workflow schema, producing both the training and inference inputs.
+            logger.info(
+                "LABELED CSV MODE: Skipping download, preprocess, and auto_label jobs"
+            )
+            prepare_job = (
+                Job(
+                    "prepare_labeled_csv",
+                    _id="prepare_labeled_csv",
+                    node_label="prepare_labeled_csv",
+                )
+                .add_args(
+                    "--input-dir", ".",
+                    "--output", atl03_preprocessed,
+                    "--labeled-output", labeled_data,
+                )
+                .add_inputs(
+                    *[File(os.path.basename(p)) for p in labeled_csv_files]
+                )
+                .add_outputs(atl03_preprocessed, stage_out=True, register_replica=False)
+                .add_outputs(labeled_data, stage_out=True, register_replica=False)
+            )
+            self.wf.add_jobs(prepare_job)
+        elif test_mode:
             # In test mode, skip downloads and use pre-generated synthetic data
             # Files are registered in the replica catalog by create_replica_catalog()
             logger.info("TEST MODE: Skipping download jobs, using synthetic test data")
@@ -351,23 +411,27 @@ class SeaIceWorkflow:
             )
             self.wf.add_jobs(download_sentinel2_job)
 
-        # Job 3: Preprocess ATL03
-        preprocess_job = (
-            Job(
-                "preprocess_atl03",
-                _id="preprocess_atl03",
-                node_label="preprocess_atl03",
+        # Job 3: Preprocess ATL03 (already done upstream in labeled-CSV mode)
+        if not labeled_csv_files:
+            preprocess_job = (
+                Job(
+                    "preprocess_atl03",
+                    _id="preprocess_atl03",
+                    node_label="preprocess_atl03",
+                )
+                .add_args(
+                    "--input", atl03_data,
+                    "--output", atl03_preprocessed,
+                )
+                .add_inputs(atl03_data)
+                .add_outputs(atl03_preprocessed, stage_out=True, register_replica=False)
             )
-            .add_args(
-                "--input", atl03_data,
-                "--output", atl03_preprocessed,
-            )
-            .add_inputs(atl03_data)
-            .add_outputs(atl03_preprocessed, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(preprocess_job)
+            self.wf.add_jobs(preprocess_job)
 
-        if test_mode:
+        if labeled_csv_files:
+            # Labels come straight from the input CSVs
+            logger.info("LABELED CSV MODE: Skipping auto_label job, labels are provided")
+        elif test_mode:
             # In test mode, skip auto_label — labeled_data.csv is provided
             # via the replica catalog from generate_test_data.py
             logger.info("TEST MODE: Skipping auto_label job, using pre-built labeled_data.csv")
@@ -409,22 +473,23 @@ class SeaIceWorkflow:
         self.wf.add_jobs(train_job)
 
         # Job 6: Classify sea ice
-        # Determine fan-out width: test_mode -> 2, local granules -> exact count,
-        # max_granules set -> that value, else single job
-        num_classify_jobs = None
-        if test_mode:
-            num_classify_jobs = 2
+        # Determine the granules to fan out over: labeled CSVs carry their own
+        # granule keys, otherwise granules are the merge job's granule_NNNN groups
+        granule_keys = None
+        if labeled_csv_files:
+            granule_keys = [granule_key_from_csv(p) for p in labeled_csv_files]
+        elif test_mode:
+            granule_keys = [f"granule_{i:04d}" for i in range(2)]
         elif local_atl03_files:
             # Granule count is known exactly, so fan out to match it
-            num_classify_jobs = len(local_atl03_files)
+            granule_keys = [f"granule_{i:04d}" for i in range(len(local_atl03_files))]
         elif max_granules is not None:
-            num_classify_jobs = max_granules
+            granule_keys = [f"granule_{i:04d}" for i in range(max_granules)]
 
-        if num_classify_jobs is not None and num_classify_jobs > 1:
+        if granule_keys is not None and len(granule_keys) > 1:
             # Fan-out: one classify job per granule
             per_granule_files = []
-            for i in range(num_classify_jobs):
-                granule_id_str = f"granule_{i:04d}"
+            for i, granule_id_str in enumerate(granule_keys):
                 per_granule_file = File(f"classification_{granule_id_str}.csv")
                 per_granule_files.append(per_granule_file)
 
@@ -609,6 +674,15 @@ Available regions:
              "still run as usual."
     )
     parser.add_argument(
+        "--labeled-csv-dir",
+        type=str,
+        default=None,
+        help="Directory of pre-labeled ATL03 segment CSVs (e.g. IS2_Corrected_data). "
+             "Skips the download, preprocess, and auto-label stages: the CSVs are "
+             "harmonized into the workflow schema and fed straight to training and "
+             "inference. No Earthdata or Planetary Computer access is needed."
+    )
+    parser.add_argument(
         "--max-granules",
         type=int,
         default=None,
@@ -642,6 +716,29 @@ Available regions:
 
     args = parser.parse_args()
 
+    # Resolve pre-labeled segment CSVs, if any
+    labeled_csv_files = None
+    if args.labeled_csv_dir:
+        if args.test_mode:
+            parser.error("--labeled-csv-dir cannot be combined with --test-mode")
+        if args.local_atl03_dir:
+            parser.error(
+                "--labeled-csv-dir cannot be combined with --local-atl03-dir"
+            )
+        labeled_dir = os.path.abspath(os.path.expanduser(args.labeled_csv_dir))
+        if not os.path.isdir(labeled_dir):
+            parser.error(f"--labeled-csv-dir is not a directory: {labeled_dir}")
+        labeled_csv_files = sorted(glob.glob(os.path.join(labeled_dir, "*.csv")))
+        if not labeled_csv_files:
+            parser.error(f"No labeled .csv files found in {labeled_dir}")
+        keys = [granule_key_from_csv(f) for f in labeled_csv_files]
+        duplicates = sorted({k for k in keys if keys.count(k) > 1})
+        if duplicates:
+            parser.error(
+                "Labeled CSVs produce duplicate granule keys, which would collide "
+                f"in the classify fan-out: {duplicates}"
+            )
+
     # Resolve local ATL03 granules, if any
     local_atl03_files = None
     if args.local_atl03_dir:
@@ -666,11 +763,14 @@ Available regions:
         if args.max_granules and len(local_atl03_files) > args.max_granules:
             local_atl03_files = local_atl03_files[:args.max_granules]
 
-    # In test mode, start-date is optional
-    if not args.test_mode and not args.start_date:
-        parser.error("--start-date is required unless --test-mode is used")
-    if args.test_mode and not args.start_date:
-        args.start_date = "2019-11-01"  # default for test mode
+    # No download happens in test or labeled-CSV mode, so start-date is optional
+    no_download = args.test_mode or labeled_csv_files
+    if not no_download and not args.start_date:
+        parser.error(
+            "--start-date is required unless --test-mode or --labeled-csv-dir is used"
+        )
+    if no_download and not args.start_date:
+        args.start_date = "2019-11-01"  # placeholder; no download job is created
 
     # Handle default end date
     if not args.end_date:
@@ -685,7 +785,8 @@ Available regions:
         logger.error(f"Invalid region: {args.region}. Valid regions: {valid_regions}")
         sys.exit(1)
 
-    if (not args.test_mode and not local_atl03_files and not args.earthdata_token
+    if (not args.test_mode and not local_atl03_files and not labeled_csv_files
+            and not args.earthdata_token
             and (not args.earthdata_username or not args.earthdata_password)):
         logger.warning(
             "No Earthdata credentials provided. Provide either:\n"
@@ -704,6 +805,11 @@ Available regions:
         logger.info(f"Granule ID: {args.granule_id}")
     if args.test_mode:
         logger.info("Mode: TEST (synthetic data, no downloads)")
+    elif labeled_csv_files:
+        logger.info(
+            f"Mode: LABELED CSV ({len(labeled_csv_files)} file(s) from "
+            f"{args.labeled_csv_dir}, no downloads or auto-labeling)"
+        )
     elif local_atl03_files:
         logger.info(
             f"Mode: LOCAL ATL03 ({len(local_atl03_files)} granule(s) from "
@@ -736,7 +842,9 @@ Available regions:
 
         logger.info("Creating replica catalog...")
         workflow.create_replica_catalog(
-            test_mode=args.test_mode, local_atl03_files=local_atl03_files
+            test_mode=args.test_mode,
+            local_atl03_files=local_atl03_files,
+            labeled_csv_files=labeled_csv_files,
         )
 
         logger.info("Creating sea ice workflow DAG...")
@@ -753,6 +861,7 @@ Available regions:
             max_granules=args.max_granules,
             max_scenes=args.max_scenes,
             local_atl03_files=local_atl03_files,
+            labeled_csv_files=labeled_csv_files,
         )
 
         workflow.write()

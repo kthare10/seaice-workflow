@@ -25,6 +25,11 @@ Full mode with --max-granules N (parallel classify jobs):
                    │                        ├──> auto_label ──> train├─ classify_seaice_1 [GPU] ─├─> merge ──> calculate_freeboard ──> visualize
                    └──> download_sentinel2 ─┘                        └─ classify_seaice_N [GPU] ─┘
 
+Labeled CSV mode (--labeled-csv-dir DIR, one classify job per input file):
+  [DIR/*.csv] ──> prepare_labeled_csv ──┬──> train_model [GPU] ──┐
+                                        │                        ├─> classify (fan-out) ──> merge ──> freeboard ──> visualize
+                                        └────────────────────────┘
+
 Local data mode (--local-atl03-dir DIR, one classify job per granule):
   [DIR/*.h5] ──> stage_atl03 ──┬──> preprocess_atl03 ───┐
                                │                        ├──> auto_label ──> train ──> classify (fan-out) ──> merge ──> freeboard ──> visualize
@@ -40,6 +45,7 @@ Test mode (--test-mode, 2 parallel classify jobs):
 |-------|-------------|--------|-----|
 | `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata (or merge local granules with `--local-atl03-dir`) | 4 GB | No |
 | `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB | No |
+| `prepare_labeled_csv` | Harmonize pre-labeled segment CSVs into the workflow schema (only in `--labeled-csv-dir` mode; replaces the three stages above) | 8 GB | No |
 | `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
 | `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
 | `train_model` | Train LSTM or MLP classifier on labeled data | 14 GB | Yes |
@@ -187,6 +193,66 @@ pegasus-plan --submit -s condorpool -o local workflow_test.yml
 
 In test mode, `--start-date` and Earthdata credentials are not required.
 
+### Labeled CSV Mode (Pre-Labeled Segment Data)
+
+If you already have **labeled, segmented** ATL03 data as CSV — for example the
+`IS2_Corrected_data` products from the co-registration and labeling step in
+Iqrah et al. — point the workflow at the directory with `--labeled-csv-dir`.
+This skips the download, preprocess, **and** auto-label stages entirely: a
+`prepare_labeled_csv` job harmonizes the files into the workflow's schema and
+feeds them straight into training and inference. No Earthdata or Planetary
+Computer access is required:
+
+```bash
+python workflow_generator.py --labeled-csv-dir data/IS2_Corrected_data \
+                              --output workflow_labeled.yml
+```
+
+The resulting DAG is `prepare_labeled_csv → train_model → classify (one job per
+input file) → merge → calculate_freeboard → visualize_results`.
+
+**Expected input columns.** Each CSV is mapped onto the workflow schema as:
+
+| Workflow column | Source column |
+|---|---|
+| `lat`, `lon` | `lat`, `lon` |
+| `along_track_dist` | `x_atc` |
+| `mean_h` | `h_cor_mean` (falls back to `height_mean`) |
+| `median_h` | `h_cor_med` (falls back to `height_med`) |
+| `std_h` | `height_sd` |
+| `photon_count` | `N` |
+| `bg_rate` | `brate_mean` |
+| `beam`, `granule` | parsed from the file name |
+| `label` | `label` (0 = thick ice, 1 = thin ice, 2 = open water) |
+
+The **corrected** heights (`h_cor_*`) are used rather than the raw ellipsoidal
+heights, because `calculate_freeboard` expects sea-surface-referenced
+elevations. If only raw heights are present the job warns and falls back to
+them, but freeboard values will be meaningless.
+
+Notes:
+
+- Each input file becomes its own `granule` (the file name minus the
+  `_labeled...` suffix), so the classify stage fans out one job per file and
+  `calculate_freeboard` computes its sliding-window sea surface per track.
+- The `label` column is carried through inference as ground truth, so
+  `visualize_results` emits a confusion matrix and per-class accuracy
+  (Fig. 4 in the paper) alongside the usual maps and profiles.
+- Training and inference run over the same corpus. `train_model` holds out a
+  stratified 20% split internally and reports `test_accuracy` in
+  `training_metrics.json` — use that as the honest accuracy number; the
+  confusion matrix covers all segments, including those seen in training.
+- Cannot be combined with `--test-mode` or `--local-atl03-dir`.
+- `--start-date` and Earthdata credentials are not required.
+
+The harmonizer can also be run standalone:
+
+```bash
+python bin/prepare_labeled_csv.py --input-dir data/IS2_Corrected_data \
+                                  --output atl03_preprocessed.csv \
+                                  --labeled-output labeled_data.csv
+```
+
 ### Local Data Mode (Already-Downloaded Granules)
 
 If you already have raw ATL03 `.h5` granules on disk — from a previous run, a
@@ -246,6 +312,8 @@ python workflow_generator.py --region ross_sea \
 --start-date          Start date (YYYY-MM-DD). Required unless --test-mode is used.
 --end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
 --test-mode           Use synthetic test data (skips downloads and auto-label)
+--labeled-csv-dir     Directory of pre-labeled ATL03 segment CSVs (skips download,
+                      preprocess, and auto-label; no credentials needed)
 --local-atl03-dir     Directory of already-downloaded ATL03 .h5 granules
                       (skips the ATL03 download; no Earthdata credentials needed)
 --max-granules        Max ATL03 granules to download (default: all)
