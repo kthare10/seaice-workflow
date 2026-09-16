@@ -25,6 +25,11 @@ Full mode with --max-granules N (parallel classify jobs):
                    │                        ├──> auto_label ──> train├─ classify_seaice_1 [GPU] ─├─> merge ──> calculate_freeboard ──> visualize
                    └──> download_sentinel2 ─┘                        └─ classify_seaice_N [GPU] ─┘
 
+Local data mode (--local-atl03-dir DIR, one classify job per granule):
+  [DIR/*.h5] ──> stage_atl03 ──┬──> preprocess_atl03 ───┐
+                               │                        ├──> auto_label ──> train ──> classify (fan-out) ──> merge ──> freeboard ──> visualize
+                               └──> download_sentinel2 ─┘
+
 Test mode (--test-mode, 2 parallel classify jobs):
   [test_data/atl03_data.h5] ──> preprocess_atl03 ───┐            ┌─ classify_seaice_0 [GPU] ─┐
   [test_data/labeled_data.csv] ────────────────────>├──> train ──├─ classify_seaice_1 [GPU] ─├──> merge ──> calculate_freeboard ──> visualize
@@ -33,7 +38,7 @@ Test mode (--test-mode, 2 parallel classify jobs):
 
 | Stage | Description | Memory | GPU |
 |-------|-------------|--------|-----|
-| `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata | 4 GB | No |
+| `download_atl03` | Fetch ICESat-2 ATL03 HDF5 granules from NASA Earthdata (or merge local granules with `--local-atl03-dir`) | 4 GB | No |
 | `download_sentinel2` | Fetch coincident Sentinel-2 imagery (parallel) | 4 GB | No |
 | `preprocess_atl03` | Filter photons, resample to 2m segments, compute features | 8 GB | No |
 | `auto_label` | Co-register S2 with ATL03, classify S2, overlay labels | 4 GB | No |
@@ -182,6 +187,43 @@ pegasus-plan --submit -s condorpool -o local workflow_test.yml
 
 In test mode, `--start-date` and Earthdata credentials are not required.
 
+### Local Data Mode (Already-Downloaded Granules)
+
+If you already have raw ATL03 `.h5` granules on disk — from a previous run, a
+shared filesystem, or a manual Earthdata download — point the workflow at the
+directory with `--local-atl03-dir`. No Earthdata credentials are required and
+no ATL03 download happens; the granules are staged in and merged into the
+workflow's `atl03_data.h5` instead:
+
+```bash
+python workflow_generator.py --region ross_sea \
+                              --start-date 2019-11-01 \
+                              --end-date 2019-11-30 \
+                              --local-atl03-dir /data/atl03_granules \
+                              --output workflow_local.yml
+```
+
+Notes:
+
+- Granules must be **raw ATL03 files** (with `gt1l`/`gt2l`/`gt3l` beam groups),
+  exactly as distributed by NASA — not a previously merged `atl03_data.h5`.
+- Every `*.h5` in the directory is used. `--granule-id` filters by filename
+  substring, and `--max-granules` caps how many are used.
+- Sentinel-2 download and `auto_label` still run as usual, driven by the track
+  bounding box computed from your local granules — so `--start-date` is still
+  required and Planetary Computer access is still needed.
+- The classify stage automatically fans out to one job per granule, since the
+  granule count is known at generation time.
+- Cannot be combined with `--test-mode`.
+
+The underlying script supports this directly too:
+
+```bash
+python bin/download_atl03.py --region ross_sea --start-date 2019-11-01 \
+                             --input-dir /data/atl03_granules \
+                             --output atl03_data.h5
+```
+
 ### Limited Download Mode
 
 To run with real data but limit download volume for faster testing, use
@@ -204,6 +246,8 @@ python workflow_generator.py --region ross_sea \
 --start-date          Start date (YYYY-MM-DD). Required unless --test-mode is used.
 --end-date            End date (YYYY-MM-DD), defaults to start_date + 30 days
 --test-mode           Use synthetic test data (skips downloads and auto-label)
+--local-atl03-dir     Directory of already-downloaded ATL03 .h5 granules
+                      (skips the ATL03 download; no Earthdata credentials needed)
 --max-granules        Max ATL03 granules to download (default: all)
 --max-scenes          Max Sentinel-2 scenes to download (default: 10)
 --earthdata-token     Pre-generated bearer token (default: $EARTHDATA_TOKEN)

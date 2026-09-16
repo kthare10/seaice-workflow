@@ -36,6 +36,7 @@ Usage:
 """
 
 import argparse
+import glob
 import logging
 import os
 import sys
@@ -225,10 +226,23 @@ class SeaIceWorkflow:
             merge_classifications,
         )
 
-    def create_replica_catalog(self, test_mode=False):
-        """Create replica catalog."""
+    def create_replica_catalog(self, test_mode=False, local_atl03_files=None):
+        """Create replica catalog.
+
+        Args:
+            test_mode: Register synthetic test data instead of downloading.
+            local_atl03_files: Optional list of already-downloaded ATL03 .h5
+                granule paths to register as workflow inputs.
+        """
         logger.info("Creating replica catalog")
         self.rc = ReplicaCatalog()
+
+        if local_atl03_files:
+            for path in local_atl03_files:
+                self.rc.add_replica("local", os.path.basename(path), "file://" + path)
+            logger.info(
+                f"Registered {len(local_atl03_files)} local ATL03 granule(s)"
+            )
 
         if test_mode:
             # Register synthetic test data so download jobs can be skipped
@@ -249,7 +263,8 @@ class SeaIceWorkflow:
     def create_workflow(self, region, start_date, end_date, granule_id=None,
                         model_type="lstm", earthdata_token=None,
                         earthdata_username=None, earthdata_password=None,
-                        test_mode=False, max_granules=None, max_scenes=None):
+                        test_mode=False, max_granules=None, max_scenes=None,
+                        local_atl03_files=None):
         """Create the workflow DAG."""
         logger.info("Creating workflow DAG")
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
@@ -273,7 +288,8 @@ class SeaIceWorkflow:
             # Files are registered in the replica catalog by create_replica_catalog()
             logger.info("TEST MODE: Skipping download jobs, using synthetic test data")
         else:
-            # Job 1: Download ATL03 data
+            # Job 1: Acquire ATL03 data — either download from Earthdata, or
+            # merge already-downloaded granules staged in from a local directory
             download_atl03_args = [
                 "--region", region,
                 "--start-date", start_date,
@@ -284,18 +300,27 @@ class SeaIceWorkflow:
                 download_atl03_args.extend(["--granule-id", granule_id])
             if max_granules:
                 download_atl03_args.extend(["--max-granules", str(max_granules)])
+            if local_atl03_files:
+                # Granules are staged flat into the job working directory
+                download_atl03_args.extend(["--input-dir", "."])
 
+            node_label = "stage_atl03" if local_atl03_files else "download_atl03"
             download_atl03_job = (
                 Job(
                     "download_atl03",
                     _id="download_atl03",
-                    node_label="download_atl03",
+                    node_label=node_label,
                 )
                 .add_args(*download_atl03_args)
                 .add_outputs(atl03_data, stage_out=True, register_replica=False)
                 .add_outputs(atl03_bbox, stage_out=False, register_replica=False)
             )
-            if earthdata_token:
+            if local_atl03_files:
+                # No credentials needed — the job never touches the network
+                download_atl03_job.add_inputs(
+                    *[File(os.path.basename(p)) for p in local_atl03_files]
+                )
+            elif earthdata_token:
                 download_atl03_job.add_env(EARTHDATA_TOKEN=earthdata_token)
             elif earthdata_username and earthdata_password:
                 download_atl03_job.add_env(
@@ -384,10 +409,14 @@ class SeaIceWorkflow:
         self.wf.add_jobs(train_job)
 
         # Job 6: Classify sea ice
-        # Determine fan-out width: test_mode -> 2, max_granules set -> that value, else single job
+        # Determine fan-out width: test_mode -> 2, local granules -> exact count,
+        # max_granules set -> that value, else single job
         num_classify_jobs = None
         if test_mode:
             num_classify_jobs = 2
+        elif local_atl03_files:
+            # Granule count is known exactly, so fan out to match it
+            num_classify_jobs = len(local_atl03_files)
         elif max_granules is not None:
             num_classify_jobs = max_granules
 
@@ -571,6 +600,15 @@ Available regions:
              "Skips download and auto-label jobs. Run 'python generate_test_data.py' first."
     )
     parser.add_argument(
+        "--local-atl03-dir",
+        type=str,
+        default=None,
+        help="Directory of already-downloaded ATL03 .h5 granules. Skips the "
+             "Earthdata download (no credentials needed); the granules are "
+             "staged in and merged instead. Sentinel-2 download and auto-labeling "
+             "still run as usual."
+    )
+    parser.add_argument(
         "--max-granules",
         type=int,
         default=None,
@@ -604,6 +642,30 @@ Available regions:
 
     args = parser.parse_args()
 
+    # Resolve local ATL03 granules, if any
+    local_atl03_files = None
+    if args.local_atl03_dir:
+        if args.test_mode:
+            parser.error("--local-atl03-dir cannot be combined with --test-mode")
+        local_dir = os.path.abspath(os.path.expanduser(args.local_atl03_dir))
+        if not os.path.isdir(local_dir):
+            parser.error(f"--local-atl03-dir is not a directory: {local_dir}")
+        local_atl03_files = sorted(glob.glob(os.path.join(local_dir, "*.h5")))
+        if args.granule_id:
+            # Filter here as well as in the job, so the classify fan-out width
+            # matches the granules that actually get merged
+            local_atl03_files = [
+                f for f in local_atl03_files
+                if args.granule_id in os.path.basename(f)
+            ]
+        if not local_atl03_files:
+            parser.error(
+                f"No ATL03 .h5 granules found in {local_dir}"
+                + (f" matching granule ID {args.granule_id}" if args.granule_id else "")
+            )
+        if args.max_granules and len(local_atl03_files) > args.max_granules:
+            local_atl03_files = local_atl03_files[:args.max_granules]
+
     # In test mode, start-date is optional
     if not args.test_mode and not args.start_date:
         parser.error("--start-date is required unless --test-mode is used")
@@ -623,7 +685,8 @@ Available regions:
         logger.error(f"Invalid region: {args.region}. Valid regions: {valid_regions}")
         sys.exit(1)
 
-    if not args.test_mode and not args.earthdata_token and (not args.earthdata_username or not args.earthdata_password):
+    if (not args.test_mode and not local_atl03_files and not args.earthdata_token
+            and (not args.earthdata_username or not args.earthdata_password)):
         logger.warning(
             "No Earthdata credentials provided. Provide either:\n"
             "  --earthdata-token / $EARTHDATA_TOKEN (preferred for FABRIC), or\n"
@@ -641,6 +704,13 @@ Available regions:
         logger.info(f"Granule ID: {args.granule_id}")
     if args.test_mode:
         logger.info("Mode: TEST (synthetic data, no downloads)")
+    elif local_atl03_files:
+        logger.info(
+            f"Mode: LOCAL ATL03 ({len(local_atl03_files)} granule(s) from "
+            f"{args.local_atl03_dir}, no Earthdata download)"
+        )
+        if args.max_scenes:
+            logger.info(f"Max Sentinel-2 scenes: {args.max_scenes}")
     else:
         logger.info(f"Earthdata auth: {'token' if args.earthdata_token else 'username/password' if args.earthdata_username else 'NOT SET'}")
         if args.max_granules:
@@ -665,7 +735,9 @@ Available regions:
         workflow.create_transformation_catalog(args.execution_site_name)
 
         logger.info("Creating replica catalog...")
-        workflow.create_replica_catalog(test_mode=args.test_mode)
+        workflow.create_replica_catalog(
+            test_mode=args.test_mode, local_atl03_files=local_atl03_files
+        )
 
         logger.info("Creating sea ice workflow DAG...")
         workflow.create_workflow(
@@ -680,6 +752,7 @@ Available regions:
             test_mode=args.test_mode,
             max_granules=args.max_granules,
             max_scenes=args.max_scenes,
+            local_atl03_files=local_atl03_files,
         )
 
         workflow.write()

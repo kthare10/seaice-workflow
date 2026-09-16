@@ -83,9 +83,14 @@ def _write_track_bbox(h5_path, bbox_path="atl03_bbox.json", pad_deg=0.5):
     logger.info(f"Saved to {bbox_path}")
 
 
-def download_atl03(region, start_date, end_date, output_file, granule_id=None, max_granules=None):
+def download_atl03(region, start_date, end_date, output_file, granule_id=None,
+                   max_granules=None, input_dir=None):
     """
-    Download ATL03 granules from NASA Earthdata.
+    Acquire ATL03 granules and merge them into a single workflow HDF5 file.
+
+    Granules come either from NASA Earthdata (the default) or, when input_dir
+    is given, from a directory of already-downloaded .h5 files — in which case
+    no credentials are needed and no network access is performed.
 
     Args:
         region: Region name or bounding box tuple
@@ -93,14 +98,49 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None, m
         end_date: End date string (YYYY-MM-DD)
         output_file: Output HDF5 file path
         granule_id: Optional specific granule ID to download
+        max_granules: Maximum number of granules to use (default: all)
+        input_dir: Directory of already-downloaded ATL03 .h5 granules. When
+            set, Earthdata search/download is skipped entirely.
     """
     import os
     import time
     from pathlib import Path
 
+    # Get bounding box
+    if isinstance(region, str):
+        if region not in REGIONS:
+            raise ValueError(f"Unknown region: {region}. Available: {list(REGIONS.keys())}")
+        bbox = REGIONS[region]
+    else:
+        bbox = region
+
+    if input_dir:
+        # Exclude the merged output itself, in case it lives in the input
+        # directory (e.g. --input-dir . inside a Pegasus job working dir)
+        out_name = Path(output_file).resolve()
+        local_files = sorted(
+            str(p) for p in Path(input_dir).glob("*.h5")
+            if p.resolve() != out_name
+        )
+        if granule_id:
+            local_files = [f for f in local_files if granule_id in Path(f).name]
+        if not local_files:
+            logger.error(
+                f"No ATL03 .h5 granules found in {input_dir}"
+                + (f" matching granule ID {granule_id}" if granule_id else "")
+            )
+            sys.exit(1)
+        if max_granules and len(local_files) > max_granules:
+            logger.info(f"Limiting to {max_granules} granules (--max-granules)")
+            local_files = local_files[:max_granules]
+
+        logger.info(f"Using {len(local_files)} local ATL03 granule(s) from {input_dir}")
+        _merge_granules(
+            local_files, output_file, region, bbox, start_date, end_date
+        )
+        return
+
     import earthaccess
-    import h5py
-    import numpy as np
     import requests
     from requests.exceptions import ConnectionError, ChunkedEncodingError, SSLError
 
@@ -123,14 +163,6 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None, m
             "  - EARTHDATA_USERNAME and EARTHDATA_PASSWORD\n"
             "Register at https://urs.earthdata.nasa.gov/"
         )
-
-    # Get bounding box
-    if isinstance(region, str):
-        if region not in REGIONS:
-            raise ValueError(f"Unknown region: {region}. Available: {list(REGIONS.keys())}")
-        bbox = REGIONS[region]
-    else:
-        bbox = region
 
     logger.info(f"Searching ATL03 granules for region bbox={bbox}")
     logger.info(f"Date range: {start_date} to {end_date}")
@@ -211,12 +243,35 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None, m
 
     logger.info(f"Downloaded {len(downloaded_files)} files")
 
+    _merge_granules(
+        downloaded_files, output_file, region, bbox, start_date, end_date
+    )
+
+
+def _merge_granules(granule_files, output_file, region, bbox, start_date, end_date):
+    """
+    Merge a list of ATL03 HDF5 granules into a single workflow-format HDF5 file.
+
+    Each input granule becomes a ``granule_NNNN`` group holding the strong-beam
+    photon and geolocation datasets used downstream. Also writes the track
+    bounding box JSON consumed by the Sentinel-2 download job.
+
+    Args:
+        granule_files: Iterable of paths to raw ATL03 .h5 granules
+        output_file: Output merged HDF5 file path
+        region: Region name or bounding box tuple (stored as an attribute)
+        bbox: Search bounding box (used when region is not a name)
+        start_date: Start date string (stored as an attribute)
+        end_date: End date string (stored as an attribute)
+    """
+    import h5py
+
     # Merge into a single output HDF5 file
     strong_beams = ['gt1l', 'gt2l', 'gt3l']
 
     with h5py.File(output_file, 'w') as out_h5:
         granule_count = 0
-        for fpath in downloaded_files:
+        for fpath in granule_files:
             fpath = str(fpath)
             if not fpath.endswith('.h5'):
                 continue
@@ -284,7 +339,7 @@ def download_atl03(region, start_date, end_date, output_file, granule_id=None, m
         logger.info(f"Total photons across all beams: {total_photons:,}")
 
     print(f"\n{'='*70}")
-    print("ATL03 DOWNLOAD COMPLETE")
+    print("ATL03 INPUT READY")
     print(f"{'='*70}")
     print(f"Granules: {granule_count}")
     print(f"Total photons: {total_photons:,}")
@@ -303,6 +358,9 @@ Examples:
 
   # Download specific granule
   %(prog)s --region ross_sea --start-date 2019-11-01 --granule-id ATL03_20191101
+
+  # Use granules already on disk (no Earthdata credentials needed)
+  %(prog)s --region ross_sea --start-date 2019-11-01 --input-dir /data/atl03
         """
     )
 
@@ -310,6 +368,10 @@ Examples:
                         help="Region name (ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean)")
     parser.add_argument("--start-date", type=str, required=True,
                         help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--input-dir", type=str, default=None,
+                        help="Directory of already-downloaded ATL03 .h5 granules. "
+                             "When set, Earthdata search/download is skipped and no "
+                             "credentials are required.")
     parser.add_argument("--end-date", type=str, default=None,
                         help="End date (YYYY-MM-DD), defaults to start_date + 30 days")
     parser.add_argument("--granule-id", type=str, default=None,
@@ -334,10 +396,11 @@ Examples:
             output_file=args.output,
             granule_id=args.granule_id,
             max_granules=args.max_granules,
+            input_dir=args.input_dir,
         )
-        logger.info("ATL03 download completed successfully")
+        logger.info("ATL03 staging completed successfully")
     except Exception as e:
-        logger.error(f"Failed to download ATL03 data: {e}")
+        logger.error(f"Failed to acquire ATL03 data: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
