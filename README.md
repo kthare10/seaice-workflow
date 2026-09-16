@@ -62,79 +62,109 @@ Test mode (--test-mode, 2 parallel classify jobs):
 | `calculate_freeboard` | 10 km / 5 km-step windows, NASA Eq. 2–3 sea surface, freeboard | 8 GB | No |
 | `visualize_results` | Maps, along-track profiles, held-out confusion matrix, summary statistics | 4 GB | No |
 
-## Execution Environments
+## Installation
 
-This workflow requires Pegasus WMS and HTCondor. Two options are available:
+### Get the code
 
-### Option A: FABRIC Testbed (Recommended for GPU Workflows)
-
-Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-testbed.net/) using the automated provisioning notebook.
-
-**Prerequisites:**
-- A FABRIC account and active project allocation
-- JupyterHub access via the FABRIC portal
-
-**Setup:**
-
-1. Open the **PegasusAI** artifact on FABRIC:
-   <https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39>
-
-2. Download the `.tgz` archive and upload the notebook to the FABRIC JupyterHub, or clone the artifact directly in a FABRIC Jupyter terminal.
-
-3. Run the notebook cells to:
-   - Create a FABRIC slice with a submit node and one or more worker nodes across FABRIC sites
-   - Configure FABNetv4 networking between all nodes
-   - Install HTCondor (Central Manager on submit node, execute daemons on workers)
-   - Install Pegasus WMS on the submit node
-   - Set up passwordless SSH and hostname resolution (`/etc/hosts`)
-
-4. Once the cluster is running, SSH into the submit node and clone this repository:
-
-   ```bash
-   git clone <repo-url> && cd seaice-workflow
-   ```
-
-5. Open **`Access-SeaIce-workflow.ipynb`** in Jupyter and follow the cells to configure, generate, submit, monitor, and inspect results — or use the [CLI instructions](#generate-and-submit-workflow) below.
-
-> **Note:** FABRIC worker nodes can be provisioned with NVIDIA GPUs (e.g., RTX6000, A30, A40) for the `train_model` and `classify_seaice` stages. Request GPU components in the notebook when creating your slice.
-
-### Option B: ACCESS Pegasus (Hosted Environment)
-
-[ACCESS Pegasus](https://pegasus.access-ci.org/) is a hosted workflow environment — no cluster setup required. A built-in **test pool** lets you get started immediately without an allocation.
-
-**Setup:**
-
-1. Log in at <https://pegasus.access-ci.org/> using your ACCESS credentials (single sign-on).
-2. Open a Jupyter notebook or terminal from the Open OnDemand dashboard.
-3. Clone this repository:
-
-   ```bash
-   git clone <repo-url> && cd seaice-workflow
-   ```
-
-4. Open **`Access-SeaIce-workflow.ipynb`** — the notebook walks through configuration, workflow generation, submission, monitoring, and result visualization interactively.
-
-5. **To get started quickly**, the notebook submits to the built-in test pool — no allocation needed.
-
-6. **To scale up**, request an [ACCESS allocation](https://allocations.access-ci.org/) and use **HTCondor Annex** to provision pilot jobs on allocated resources (see the [ACCESS Pegasus examples](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples)).
-
-> **Note:** The test pool has limited resources and no GPUs. For the GPU-accelerated `train_model` and `classify_seaice` stages, provision GPU nodes via HTCondor Annex with an ACCESS allocation.
-
-## Quick Start
+```bash
+git clone https://github.com/kthare10/seaice-workflow.git
+cd seaice-workflow
+```
 
 ### Prerequisites
 
-- Python 3.10+
-- [Pegasus WMS](https://pegasus.isi.edu/) 5.0+
-- HTCondor (for condorpool execution)
-- NVIDIA GPU with CUDA drivers on worker nodes (for training/classification)
-- NASA Earthdata account (see below) — **not** required for
-  [Labeled CSV Mode](#labeled-csv-mode-pre-labeled-segment-data),
-  [Local Data Mode](#local-data-mode-already-downloaded-granules), or `--test-mode`
+What you need depends on how you intend to run it:
 
-Both execution environments above (FABRIC, ACCESS Pegasus) satisfy these prerequisites automatically.
+| | Run manually | Run with Pegasus |
+|---|---|---|
+| Python 3.10+ | yes | yes (submit host only) |
+| Apptainer/Singularity **or** a local Python env | yes | Apptainer on the workers |
+| [Pegasus WMS](https://pegasus.isi.edu/) 5.0+ | no | yes |
+| HTCondor | no | yes |
+| NVIDIA GPU + CUDA 12.3+ drivers | optional (CPU fallback works) | on worker nodes |
+| NASA Earthdata account | only for the download path | only for the download path |
 
-> **Recommended:** Use the **`Access-SeaIce-workflow.ipynb`** Jupyter notebook for an interactive, guided experience. The CLI instructions below are equivalent.
+`--test-mode`, `--labeled-csv-dir`, and `--local-atl03-dir` need **no Earthdata
+credentials** (`--local-atl03-dir` still fetches Sentinel-2).
+
+Both hosted environments below ([FABRIC](#option-a-fabric-testbed), [ACCESS
+Pegasus](#option-b-access-pegasus-hosted)) satisfy the Pegasus prerequisites for you.
+
+### Containers
+
+Two images keep the footprint down: only the GPU image carries TensorFlow and CUDA.
+
+| Image | Used by | Base |
+|---|---|---|
+| `kthare10/seaice-icesat2-cpu` | download, preprocess, prepare, label, merge, freeboard, visualize | `python:3.10-slim` |
+| `kthare10/seaice-icesat2-gpu` | train, classify | `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` |
+
+**Build SIF images (Apptainer/Singularity).** This is what you want for manual runs, and
+for pre-staging images on a cluster so every job does not re-pull from Docker Hub:
+
+```bash
+mkdir -p Apptainer
+
+# Straight from Docker Hub - no Docker daemon needed
+apptainer build Apptainer/seaice-cpu.sif docker://kthare10/seaice-icesat2-cpu:latest
+apptainer build Apptainer/seaice-gpu.sif docker://kthare10/seaice-icesat2-gpu:latest
+```
+
+A SIF is uncompressed, so budget more disk than the Docker Hub figures suggest: about
+**1.5 GB** for the CPU image (600 MB compressed) and **9 GB** for the GPU one (3.9 GB
+compressed). Each takes a few minutes. `singularity` works identically if that is what
+your site provides.
+
+> **The images carry only the Python environment, not the code.** `bin/*.py` is bind-mounted
+> for manual runs and staged in by Pegasus (`is_stageable=True`), so editing a stage script
+> never requires rebuilding an image. You only need to rebuild when dependencies change.
+
+**Build from the Dockerfiles instead** (when you have changed dependencies):
+
+```bash
+docker build -t seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
+docker build -t seaice-icesat2-gpu:latest -f Docker/Seaice_Dockerfile .
+
+# Convert the locally built images to SIF
+apptainer build Apptainer/seaice-cpu.sif docker-daemon://seaice-icesat2-cpu:latest
+apptainer build Apptainer/seaice-gpu.sif docker-daemon://seaice-icesat2-gpu:latest
+```
+
+**Verify an image:**
+
+```bash
+apptainer exec Apptainer/seaice-cpu.sif \
+    python3 -c "import pandas, rasterio, pyproj, scipy; print('cpu ok')"
+apptainer exec --nv Apptainer/seaice-gpu.sif \
+    python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+If the GPU check prints an empty list the container cannot see a device — check the host
+driver and that you passed `--nv`. TensorFlow falls back to CPU, just slowly.
+
+**Using local SIFs with Pegasus.** The workflow points at Docker Hub by default. To use
+images you built, edit the two `Container(...)` definitions in `workflow_generator.py`
+(`create_transformation_catalog`):
+
+```python
+image="file:///absolute/path/to/Apptainer/seaice-cpu.sif",
+```
+
+### Python environment (manual runs without containers)
+
+If you would rather not use containers, install the dependencies directly. Use a virtual
+environment — several packages (rasterio, h5py, tensorflow) pull large binary wheels:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`requirements.txt` includes `tensorflow`, which only `train_model.py` and
+`classify_seaice.py` need. For the other stages this subset suffices:
+`numpy pandas scipy scikit-learn h5py matplotlib rasterio pyproj earthaccess
+planetary-computer pystac-client requests`.
 
 ### NASA Earthdata Credentials
 
@@ -162,7 +192,157 @@ export EARTHDATA_USERNAME="your_username"
 export EARTHDATA_PASSWORD="your_password"
 ```
 
-### Generate and Submit Workflow
+## Running Manually (without Pegasus)
+
+Every stage is a standalone CLI script in `bin/`. Running them in order reproduces
+exactly what the workflow does — useful for development, for a single track, or on a
+machine with no HTCondor.
+
+All commands assume you are in the repository root and that outputs land in the current
+directory.
+
+### Quick smoke test
+
+```bash
+python generate_test_data.py     # synthetic granules -> test_data/
+./run_test.sh                    # whole chain, ~1 minute, 11 checks
+```
+
+No credentials, no network. It exercises preprocess, train, classify, freeboard, and
+visualize against planted synthetic data, so a failure here is a code problem rather than
+a data problem.
+
+### Path A: from pre-labeled segment CSVs
+
+The shortest path to results if you already have labeled data (for example the
+`IS2_Corrected_data` products). No credentials, no downloads:
+
+```bash
+# 1. Harmonize the labeled CSVs into the workflow schema
+python bin/prepare_labeled_csv.py \
+    --input-dir data/IS2_Corrected_data \
+    --output atl03_preprocessed.csv \
+    --labeled-output labeled_data.csv
+
+# 2. Train (GPU if available, CPU otherwise)
+python bin/train_model.py \
+    --input labeled_data.csv \
+    --model-output model.h5 \
+    --metrics-output training_metrics.json \
+    --model-type lstm
+
+# 3. Classify every segment
+python bin/classify_seaice.py \
+    --input atl03_preprocessed.csv \
+    --model model.h5 \
+    --output classification_results.csv
+
+# 4. Freeboard
+python bin/calculate_freeboard.py \
+    --input classification_results.csv \
+    --output freeboard_results.csv
+
+# 5. Figures and statistics
+python bin/visualize_results.py \
+    --classification-input classification_results.csv \
+    --freeboard-input freeboard_results.csv \
+    --metrics-input training_metrics.json \
+    --classification-map-output classification_map.png \
+    --freeboard-profile-output freeboard_profile.png \
+    --summary-output summary_statistics.json
+```
+
+Pass `--metrics-input` to step 5, or the confusion matrix falls back to all segments
+(including those used for training) instead of the held-out 20 %.
+
+### Path B: the full pipeline from NASA data
+
+Requires Earthdata credentials (see [above](#nasa-earthdata-credentials)) and access to
+NASA CMR and Microsoft Planetary Computer:
+
+```bash
+export EARTHDATA_TOKEN="your_token_here"
+
+# 1. Fetch and merge ATL03 granules. Also writes atl03_bbox.json with the
+#    per-granule track footprint and UTC overpass window.
+python bin/download_atl03.py \
+    --region ross_sea --start-date 2019-11-01 --end-date 2019-11-30 \
+    --max-granules 2 \
+    --output atl03_data.h5
+
+# 2. Sentinel-2 scenes coincident with each pass (uses the bbox + times from step 1)
+python bin/download_sentinel2.py \
+    --bbox-file atl03_bbox.json \
+    --output sentinel2_scenes.tar.gz
+
+# 3. Photons -> corrected 2 m segments
+python bin/preprocess_atl03.py \
+    --input atl03_data.h5 \
+    --output atl03_preprocessed.csv
+
+# 4. Transfer Sentinel-2 labels onto the segments
+python bin/auto_label.py \
+    --atl03-input atl03_preprocessed.csv \
+    --sentinel2-input sentinel2_scenes.tar.gz \
+    --output labeled_data.csv
+
+# 5-8. train / classify / freeboard / visualize - identical to Path A steps 2-5
+```
+
+Start with `--max-granules 2` and `--max-scenes 3`; a full month of Ross Sea ATL03 is
+hundreds of gigabytes.
+
+If you already have raw `.h5` granules, replace step 1 with:
+
+```bash
+python bin/download_atl03.py \
+    --region ross_sea --start-date 2019-11-01 \
+    --input-dir /path/to/granules \
+    --output atl03_data.h5
+```
+
+### Running stages inside a container
+
+Bind the working directory in and run the same commands. Apptainer passes your exported
+environment through, so `EARTHDATA_TOKEN` is visible inside:
+
+```bash
+# CPU stages
+apptainer exec --bind "$PWD:/work" --pwd /work Apptainer/seaice-cpu.sif \
+    python3 bin/preprocess_atl03.py --input atl03_data.h5 --output atl03_preprocessed.csv
+
+# GPU stages need --nv
+apptainer exec --nv --bind "$PWD:/work" --pwd /work Apptainer/seaice-gpu.sif \
+    python3 bin/train_model.py --input labeled_data.csv \
+        --model-output model.h5 --metrics-output training_metrics.json
+```
+
+### Stage reference
+
+| # | Script | Reads | Writes | Image | Notes |
+|---|--------|-------|--------|-------|-------|
+| 1 | `download_atl03.py` | NASA CMR, or `--input-dir` | `atl03_data.h5`, `atl03_bbox.json` | CPU | `--input-dir` skips all network access |
+| 2 | `download_sentinel2.py` | `atl03_bbox.json` | `sentinel2_scenes.tar.gz` | CPU | ±80 min coincidence per granule |
+| 3 | `preprocess_atl03.py` | `atl03_data.h5` | `atl03_preprocessed.csv` | CPU | ~8 GB on a full granule |
+| 4 | `auto_label.py` | preprocessed + S2 archive | `labeled_data.csv` | CPU | fails loudly if nothing gets labeled |
+| — | `prepare_labeled_csv.py` | `--input-dir` of labeled CSVs | both CSVs above | CPU | replaces stages 1-4 |
+| 5 | `train_model.py` | `labeled_data.csv` | `model.h5`, `model.scaler.npz`, `training_metrics.json` | GPU | ~14 GB; 20 epochs |
+| 6 | `classify_seaice.py` | preprocessed + model | `classification_results.csv` | GPU | `--granule` restricts to one track |
+| — | `merge_classifications.py` | `--inputs a.csv b.csv …` | one CSV | CPU | only if you ran step 6 per granule |
+| 7 | `calculate_freeboard.py` | classification results | `freeboard_results.csv` | CPU | groups by granule+beam internally |
+| 8 | `visualize_results.py` | classification + freeboard (+ metrics) | 2 PNGs, `summary_statistics.json` | CPU | pass `--metrics-input` for held-out stats |
+
+Every script supports `--help`.
+
+## Running with Pegasus
+
+Pegasus handles staging, parallelism, retries, and provenance. Generate a DAG with
+`workflow_generator.py`, then plan and submit it.
+
+> Prefer an interactive walkthrough? **`Access-SeaIce-workflow.ipynb`** covers
+> configuration, generation, submission, monitoring, and results.
+
+### Generate and submit
 
 ```bash
 # Generate workflow DAG (token from $EARTHDATA_TOKEN)
@@ -185,36 +365,7 @@ pegasus-plan --submit -s condorpool -o local workflow.yml
 pegasus-status <run-dir>
 ```
 
-### Test Mode (No Downloads)
-
-To test the workflow end-to-end without downloading real data, use `--test-mode`.
-This skips the download and auto-label jobs and uses pre-generated synthetic data:
-
-```bash
-# Generate synthetic test data (one-time setup)
-python generate_test_data.py
-
-# Generate workflow using test data
-python workflow_generator.py --test-mode --output workflow_test.yml
-
-# Submit
-pegasus-plan --submit -s condorpool -o local workflow_test.yml
-```
-
-In test mode, `--start-date` and Earthdata credentials are not required.
-
-`generate_test_data.py` builds two synthetic **raw** ATL03 granules carrying the full
-structure the pipeline reads — photon IDs, 20 m geolocation segments, `geophys_corr`
-with an MSS flag, `bckgrd_atlas`, CAL-19 / CAL-42 tables, `atlas_beam_type`,
-`sc_orient` — with a planted 200 m pattern of thick ice (0.30 m freeboard), thin ice
-(0.05 m) and open water (0.00 m). It then pushes them through the real
-`download_atl03.py` merge and `preprocess_atl03.py`, so the test fixtures always match
-the pipeline's current schema, and labels come from the planted pattern.
-
-`./run_test.sh` runs the whole chain (generate → preprocess → train → classify →
-freeboard → visualize) locally without Pegasus and checks each output.
-
-### Labeled CSV Mode (Pre-Labeled Segment Data)
+### Mode: pre-labeled segment CSVs
 
 If you already have **labeled, segmented** ATL03 data as CSV — for example the
 `IS2_Corrected_data` products from the co-registration and labeling step in
@@ -273,7 +424,7 @@ python bin/prepare_labeled_csv.py --input-dir data/IS2_Corrected_data \
                                   --labeled-output labeled_data.csv
 ```
 
-### Local Data Mode (Already-Downloaded Granules)
+### Mode: already-downloaded granules
 
 If you already have raw ATL03 `.h5` granules on disk — from a previous run, a
 shared filesystem, or a manual Earthdata download — point the workflow at the
@@ -310,7 +461,36 @@ python bin/download_atl03.py --region ross_sea --start-date 2019-11-01 \
                              --output atl03_data.h5
 ```
 
-### Limited Download Mode
+### Mode: test data (no downloads)
+
+To test the workflow end-to-end without real data, use `--test-mode`. This skips the
+download and auto-label jobs and uses pre-generated synthetic data:
+
+```bash
+# Generate synthetic test data (one-time setup)
+python generate_test_data.py
+
+# Generate workflow using test data
+python workflow_generator.py --test-mode --output workflow_test.yml
+
+# Submit
+pegasus-plan --submit -s condorpool -o local workflow_test.yml
+```
+
+In test mode, `--start-date` and Earthdata credentials are not required.
+
+`generate_test_data.py` builds two synthetic **raw** ATL03 granules carrying the full
+structure the pipeline reads — photon IDs, 20 m geolocation segments, `geophys_corr`
+with an MSS flag, `bckgrd_atlas`, CAL-19 / CAL-42 tables, `atlas_beam_type`,
+`sc_orient` — with a planted 200 m pattern of thick ice (0.30 m freeboard), thin ice
+(0.05 m) and open water (0.00 m). It then pushes them through the real
+`download_atl03.py` merge and `preprocess_atl03.py`, so the test fixtures always match
+the pipeline's current schema, and labels come from the planted pattern.
+
+See [Running Manually](#quick-smoke-test) for `run_test.sh`, which exercises the same
+chain without Pegasus.
+
+### Mode: limited download
 
 To run with real data but limit download volume for faster testing, use
 `--max-granules` and/or `--max-scenes`:
@@ -325,7 +505,7 @@ python workflow_generator.py --region ross_sea \
                               --output workflow_limited.yml
 ```
 
-### Command-Line Options
+### Generator options
 
 ```
 --region              Region name: ross_sea, weddell_sea, beaufort_sea, arctic_ocean, southern_ocean
@@ -361,6 +541,64 @@ calculate_freeboard.py --window-radius      Default 5000 m (10 km window)
 visualize_results.py  --metrics-input       training_metrics.json, supplies the held-out
                                             confusion matrix and precision/recall/F1
 ```
+
+## Execution Environments
+
+Two ready-made environments provide Pegasus and HTCondor without any cluster setup.
+
+### Option A: FABRIC Testbed
+
+Deploy a dedicated Pegasus/HTCondor cluster on [FABRIC](https://portal.fabric-testbed.net/) using the automated provisioning notebook.
+
+**Prerequisites:**
+- A FABRIC account and active project allocation
+- JupyterHub access via the FABRIC portal
+
+**Setup:**
+
+1. Open the **PegasusAI** artifact on FABRIC:
+   <https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39>
+
+2. Download the `.tgz` archive and upload the notebook to the FABRIC JupyterHub, or clone the artifact directly in a FABRIC Jupyter terminal.
+
+3. Run the notebook cells to:
+   - Create a FABRIC slice with a submit node and one or more worker nodes across FABRIC sites
+   - Configure FABNetv4 networking between all nodes
+   - Install HTCondor (Central Manager on submit node, execute daemons on workers)
+   - Install Pegasus WMS on the submit node
+   - Set up passwordless SSH and hostname resolution (`/etc/hosts`)
+
+4. Once the cluster is running, SSH into the submit node and clone this repository:
+
+   ```bash
+   git clone <repo-url> && cd seaice-workflow
+   ```
+
+5. Open **`Access-SeaIce-workflow.ipynb`** in Jupyter and follow the cells to configure, generate, submit, monitor, and inspect results — or use the [CLI instructions](#running-with-pegasus) above.
+
+> **Note:** FABRIC worker nodes can be provisioned with NVIDIA GPUs (e.g., RTX6000, A30, A40) for the `train_model` and `classify_seaice` stages. Request GPU components in the notebook when creating your slice.
+
+### Option B: ACCESS Pegasus (hosted)
+
+[ACCESS Pegasus](https://pegasus.access-ci.org/) is a hosted workflow environment — no cluster setup required. A built-in **test pool** lets you get started immediately without an allocation.
+
+**Setup:**
+
+1. Log in at <https://pegasus.access-ci.org/> using your ACCESS credentials (single sign-on).
+2. Open a Jupyter notebook or terminal from the Open OnDemand dashboard.
+3. Clone this repository:
+
+   ```bash
+   git clone <repo-url> && cd seaice-workflow
+   ```
+
+4. Open **`Access-SeaIce-workflow.ipynb`** — the notebook walks through configuration, workflow generation, submission, monitoring, and result visualization interactively.
+
+5. **To get started quickly**, the notebook submits to the built-in test pool — no allocation needed.
+
+6. **To scale up**, request an [ACCESS allocation](https://allocations.access-ci.org/) and use **HTCondor Annex** to provision pilot jobs on allocated resources (see the [ACCESS Pegasus examples](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples)).
+
+> **Note:** The test pool has limited resources and no GPUs. For the GPU-accelerated `train_model` and `classify_seaice` stages, provision GPU nodes via HTCondor Annex with an ACCESS allocation.
 
 ## GPU Acceleration
 
@@ -443,26 +681,6 @@ Six features per 2 m segment (paper Sec. III.B.1): `mean_h`, `std_h`,
   (**Eq. 3**). Windows without leads are linearly interpolated.
 - Freeboard = corrected segment height − reference sea surface (Eq. 1).
   Tracks with no open water get no freeboard rather than an invented surface.
-
-## Container Images
-
-The workflow uses two container images to minimize footprint. Only the GPU
-image includes TensorFlow and CUDA libraries; the CPU image is much smaller.
-
-**CPU image** (download, preprocess, label, merge, freeboard, visualize):
-
-```bash
-docker build -t kthare10/seaice-icesat2-cpu:latest -f Docker/Seaice_CPU_Dockerfile .
-```
-
-**GPU image** (train, classify):
-
-```bash
-docker build -t kthare10/seaice-icesat2-gpu:latest -f Docker/Seaice_Dockerfile .
-```
-
-The workflow uses Singularity to pull from Docker Hub at runtime. GPU stages
-use `--nv` for NVIDIA device passthrough.
 
 ## Output Files
 

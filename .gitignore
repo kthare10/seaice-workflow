@@ -5,6 +5,10 @@
 test_data/
 test_output/
 
+# Container images (build with: apptainer build Apptainer/seaice-cpu.sif docker://...)
+Apptainer/
+*.sif
+
 # Python
 __pycache__/
 *.pyc
