@@ -2,7 +2,7 @@
 
 **Paper:** Iqrah, Koo, Wang, Xie, Prasad. *Scalable Higher Resolution Polar Sea Ice
 Classification and Freeboard Calculation from ICESat-2 ATL03 Data.* arXiv:2502.02700v1
-(IPDPSW 2025). Local copy: `2502.02700v1.pdf`.
+(IPDPSW 2025). <https://arxiv.org/abs/2502.02700>
 
 **Code reviewed:** `bin/*.py` and `workflow_generator.py` at commit `bf39cee`
 (2026-09-16).

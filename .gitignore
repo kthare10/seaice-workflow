@@ -30,5 +30,8 @@ transformations.yml
 CC_USAGE_LOG.md
 cc-usage-log.md
 
+# Reference paper (kept locally, see PAPER_COMPARISON.md)
+2502.02700v1.pdf
+
 # OS
 .DS_Store
