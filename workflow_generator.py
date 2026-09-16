@@ -328,6 +328,9 @@ class SeaIceWorkflow:
         atl03_preprocessed = File("atl03_preprocessed.csv")
         labeled_data = File("labeled_data.csv")
         model_file = File("model.h5")
+        # StandardScaler parameters written alongside the model; classify_seaice
+        # cannot standardize its features the same way without this file.
+        model_scaler = File("model.scaler.npz")
         training_metrics = File("training_metrics.json")
         classification_results = File("classification_results.csv")
         freeboard_results = File("freeboard_results.csv")
@@ -485,6 +488,7 @@ class SeaIceWorkflow:
             )
             .add_inputs(labeled_data)
             .add_outputs(model_file, stage_out=True, register_replica=False)
+            .add_outputs(model_scaler, stage_out=True, register_replica=False)
             .add_outputs(training_metrics, stage_out=True, register_replica=False)
         )
         self.wf.add_jobs(train_job)
@@ -522,7 +526,7 @@ class SeaIceWorkflow:
                         "--granule", granule_id_str,
                         "--output", per_granule_file,
                     )
-                    .add_inputs(atl03_preprocessed, model_file)
+                    .add_inputs(atl03_preprocessed, model_file, model_scaler)
                     .add_outputs(per_granule_file, stage_out=False, register_replica=False)
                 )
                 self.wf.add_jobs(classify_job_i)
@@ -555,7 +559,7 @@ class SeaIceWorkflow:
                     "--model", model_file,
                     "--output", classification_results,
                 )
-                .add_inputs(atl03_preprocessed, model_file)
+                .add_inputs(atl03_preprocessed, model_file, model_scaler)
                 .add_outputs(classification_results, stage_out=True, register_replica=False)
             )
             self.wf.add_jobs(classify_job)

@@ -50,9 +50,14 @@ def load_scaler(model_path):
         data = np.load(scaler_file)
         return data['mean'], data['scale']
     except FileNotFoundError:
-        logger.warning(f"Scaler file not found: {scaler_file}. Features will not be standardized "
-                       "the same way as in training.")
-        return None, None
+        # Classifying unscaled features with a model trained on standardized
+        # ones silently produces garbage rather than failing, so refuse to run.
+        logger.error(
+            f"Scaler not found: {scaler_file}. train_model.py writes it next to the "
+            "model and the features must be standardized with the same parameters "
+            "used in training. Stage this file alongside the model."
+        )
+        sys.exit(1)
 
 
 def centered_windows(X, seq_length=SEQUENCE_LENGTH):
@@ -138,8 +143,7 @@ def classify_seaice(input_file, model_path, output_file, batch_size=256, granule
         g = g.sort_values('along_track_dist') if 'along_track_dist' in g.columns else g
         X = g[FEATURE_COLUMNS].values.astype(np.float32)
         ok = np.all(np.isfinite(X), axis=1)
-        if scaler_mean is not None:
-            X = (X - scaler_mean) / scaler_scale
+        X = (X - scaler_mean) / scaler_scale
         X = np.nan_to_num(X, nan=0.0)
 
         if is_lstm:
